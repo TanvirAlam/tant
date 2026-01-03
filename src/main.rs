@@ -5,8 +5,17 @@ mod parser;
 mod renderer;
 
 use pty::PtyManager;
-use parser::TerminalParser;
+use parser::{TerminalParser, ParserEvent};
 use renderer::TerminalRenderer;
+
+#[derive(Debug, Clone)]
+pub struct Block {
+    pub command: String,
+    pub output: String,
+    pub status: Option<i32>,
+    pub start_time: std::time::Instant,
+    pub duration: Option<std::time::Duration>,
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -14,6 +23,7 @@ pub enum Message {
     KeyPress(char),
     PtyData(Vec<u8>),
     Resize(u32, u32),
+    ParserEvents(Vec<ParserEvent>),
     None,
 }
 
@@ -21,6 +31,8 @@ struct Tant {
     pty: PtyManager,
     parser: TerminalParser,
     renderer: TerminalRenderer,
+    history: Vec<Block>,
+    current_block: Option<Block>,
 }
 
 impl Application for Tant {
@@ -33,7 +45,7 @@ impl Application for Tant {
         let pty = PtyManager::new("bash").unwrap();
         let parser = TerminalParser::new(24, 80);
         let renderer = TerminalRenderer::new();
-        (Tant { pty, parser, renderer }, Command::none())
+        (Tant { pty, parser, renderer, history: vec![], current_block: None }, Command::none())
     }
 
     fn title(&self) -> String {
@@ -52,6 +64,33 @@ impl Application for Tant {
                 });
                 if n > 0 {
                     self.parser.process(&buf[..n]);
+                }
+                // Handle parser events
+                let events = self.parser.take_events();
+                for event in events {
+                    match event {
+                        ParserEvent::CommandStart => {
+                            if let Some(mut block) = self.current_block.take() {
+                                block.duration = Some(block.start_time.elapsed());
+                                self.history.push(block);
+                            }
+                            self.current_block = Some(Block {
+                                command: String::new(),
+                                output: String::new(),
+                                status: None,
+                                start_time: std::time::Instant::now(),
+                                duration: None,
+                            });
+                        }
+                        ParserEvent::CommandEnd(status) => {
+                            if let Some(mut block) = self.current_block.take() {
+                                block.status = Some(status);
+                                block.duration = Some(block.start_time.elapsed());
+                                block.output = self.parser.screen_text();
+                                self.history.push(block);
+                            }
+                        }
+                    }
                 }
                 Command::none()
             }
@@ -77,7 +116,7 @@ impl Application for Tant {
     }
 
     fn view(&self) -> Element<Message> {
-        self.renderer.view(self.parser.screen())
+        self.renderer.view(&self.history, &self.current_block, self.parser.screen())
     }
 
     fn subscription(&self) -> Subscription<Message> {
