@@ -6,6 +6,7 @@ use vt100::Parser;
 #[derive(Debug, Clone)]
 pub enum ParserEvent {
     CommandStart,
+    Command(String),
     CommandEnd(i32),
 }
 
@@ -31,6 +32,14 @@ impl TerminalParser {
                     let cmd = &data_str[start..start+semi];
                     if cmd == "CommandStart" {
                         self.events.push(ParserEvent::CommandStart);
+                    } else if cmd == "Command" {
+                        let cmd_start = start + semi + 1;
+                        if let Some(end) = data_str[cmd_start..].find('\x1b') {
+                            let command = data_str[cmd_start..cmd_start+end].to_string();
+                            self.events.push(ParserEvent::Command(command));
+                            i += cmd_start + end;
+                            continue;
+                        }
                     } else if cmd.starts_with("CommandEnd;") {
                         if let Some(status_str) = cmd.strip_prefix("CommandEnd;") {
                             if let Ok(status) = status_str.parse::<i32>() {

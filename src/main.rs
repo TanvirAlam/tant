@@ -24,6 +24,10 @@ pub enum Message {
     PtyData(Vec<u8>),
     Resize(u32, u32),
     ParserEvents(Vec<ParserEvent>),
+    UpdateCommand(usize, String),
+    RerunCommand(usize),
+    UpdateCurrent(String),
+    RunCurrent,
     None,
 }
 
@@ -33,6 +37,7 @@ struct Tant {
     renderer: TerminalRenderer,
     history: Vec<Block>,
     current_block: Option<Block>,
+    current_command: String,
 }
 
 impl Application for Tant {
@@ -45,7 +50,7 @@ impl Application for Tant {
         let pty = PtyManager::new("bash").unwrap();
         let parser = TerminalParser::new(24, 80);
         let renderer = TerminalRenderer::new();
-        (Tant { pty, parser, renderer, history: vec![], current_block: None }, Command::none())
+        (Tant { pty, parser, renderer, history: vec![], current_block: None, current_command: String::new() }, Command::none())
     }
 
     fn title(&self) -> String {
@@ -82,6 +87,11 @@ impl Application for Tant {
                                 duration: None,
                             });
                         }
+                        ParserEvent::Command(cmd) => {
+                            if let Some(ref mut block) = self.current_block {
+                                block.command = cmd;
+                            }
+                        }
                         ParserEvent::CommandEnd(status) => {
                             if let Some(mut block) = self.current_block.take() {
                                 block.status = Some(status);
@@ -111,12 +121,43 @@ impl Application for Tant {
                 self.pty.resize(rows, cols).ok();
                 Command::none()
             }
+            Message::UpdateCommand(index, new_cmd) => {
+                if let Some(block) = self.history.get_mut(index) {
+                    block.command = new_cmd;
+                }
+                Command::none()
+            }
+            Message::RerunCommand(index) => {
+                if let Some(block) = self.history.get(index) {
+                    let cmd = format!("{}\n", block.command);
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(async {
+                        use tokio::io::AsyncWriteExt;
+                        self.pty.writer().write_all(cmd.as_bytes()).await.ok();
+                    });
+                }
+                Command::none()
+            }
+            Message::UpdateCurrent(cmd) => {
+                self.current_command = cmd;
+                Command::none()
+            }
+            Message::RunCurrent => {
+                let cmd = format!("{}\n", self.current_command);
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(async {
+                    use tokio::io::AsyncWriteExt;
+                    self.pty.writer().write_all(cmd.as_bytes()).await.ok();
+                });
+                self.current_command.clear();
+                Command::none()
+            }
             Message::PtyData(_) | Message::None => Command::none(),
         }
     }
 
     fn view(&self) -> Element<Message> {
-        self.renderer.view(&self.history, &self.current_block, self.parser.screen())
+        self.renderer.view(&self.history, &self.current_block, &self.current_command, self.parser.screen())
     }
 
     fn subscription(&self) -> Subscription<Message> {
