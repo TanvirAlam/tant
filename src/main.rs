@@ -10,7 +10,9 @@ use renderer::TerminalRenderer;
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    // Placeholder
+    Tick,
+    KeyPress(char),
+    None,
 }
 
 struct Tant {
