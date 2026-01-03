@@ -1,0 +1,10 @@
+[package]
+name = "tant"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+portable-pty = "0.8"
+vt100 = "0.15"
+iced = { version = "0.12", features = ["tokio"] }
+tokio = { version = "1.0", features = ["full"] }
