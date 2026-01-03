@@ -1,4 +1,4 @@
-use iced::{Application, Command, Element, Settings, Subscription, Theme, time};
+use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window};
 
 mod pty;
 mod parser;
@@ -13,6 +13,7 @@ pub enum Message {
     Tick,
     KeyPress(char),
     PtyData(Vec<u8>),
+    Resize(u32, u32),
     None,
 }
 
@@ -63,6 +64,14 @@ impl Application for Tant {
                 });
                 Command::none()
             }
+            Message::Resize(width, height) => {
+                let (cell_w, cell_h) = self.renderer.cell_size();
+                let cols = (width as f32 / cell_w) as u16;
+                let rows = (height as f32 / cell_h) as u16;
+                self.parser.resize(rows, cols);
+                self.pty.resize(rows, cols).ok();
+                Command::none()
+            }
             Message::PtyData(_) | Message::None => Command::none(),
         }
     }
@@ -72,7 +81,14 @@ impl Application for Tant {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        time::every(std::time::Duration::from_millis(10)).map(|_| Message::Tick)
+        let time_sub = time::every(std::time::Duration::from_millis(10)).map(|_| Message::Tick);
+        let resize_sub = iced::subscription::events_with(|event, _status| {
+            match event {
+                iced::Event::Window(window::Event::Resized { width, height }) => Some(Message::Resize(width, height)),
+                _ => None,
+            }
+        });
+        Subscription::batch(vec![time_sub, resize_sub])
     }
 }
 
