@@ -1,6 +1,7 @@
 // Renderer + UI shell
 
 use iced::Element;
+use vt100::Screen;
 
 use crate::Message;
 
@@ -12,7 +13,15 @@ impl TerminalRenderer {
     }
 
     pub fn view(&self, screen: &Screen) -> Element<Message> {
-        // Placeholder: display screen size
-        iced::widget::text(format!("Terminal: {} rows x {} cols", screen.size().0, screen.size().1)).into()
+        let mut text = String::new();
+        for row in 0..screen.size().1 {
+            for col in 0..screen.size().0 {
+                if let Some(cell) = screen.cell(row, col) {
+                    text.push_str(&cell.contents());
+                }
+            }
+            text.push('\n');
+        }
+        iced::widget::text(text).into()
     }
 }

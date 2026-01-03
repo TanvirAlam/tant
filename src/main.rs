@@ -1,4 +1,4 @@
-use iced::{Application, Command, Element, Settings, Theme};
+use iced::{Application, Command, Element, Settings, Subscription, Theme, time};
 
 mod pty;
 mod parser;
@@ -12,6 +12,7 @@ use renderer::TerminalRenderer;
 pub enum Message {
     Tick,
     KeyPress(char),
+    PtyData(Vec<u8>),
     None,
 }
 
@@ -38,12 +39,40 @@ impl Application for Tant {
         "Tant Terminal".to_string()
     }
 
-    fn update(&mut self, _message: Message) -> Command<Message> {
-        Command::none()
+    fn update(&mut self, message: Message) -> Command<Message> {
+        match message {
+            Message::Tick => {
+                // Read from PTY synchronously
+                let rt = tokio::runtime::Handle::current();
+                let mut buf = vec![0u8; 1024];
+                let n = rt.block_on(async {
+                    use tokio::io::AsyncReadExt;
+                    self.pty.reader().read(&mut buf).await.unwrap_or(0)
+                });
+                if n > 0 {
+                    self.parser.process(&buf[..n]);
+                }
+                Command::none()
+            }
+            Message::KeyPress(c) => {
+                let rt = tokio::runtime::Handle::current();
+                let data = vec![c as u8];
+                rt.block_on(async {
+                    use tokio::io::AsyncWriteExt;
+                    self.pty.writer().write_all(&data).await.ok();
+                });
+                Command::none()
+            }
+            Message::PtyData(_) | Message::None => Command::none(),
+        }
     }
 
     fn view(&self) -> Element<Message> {
         self.renderer.view(self.parser.screen())
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        time::every(std::time::Duration::from_millis(10)).map(|_| Message::Tick)
     }
 }
 
