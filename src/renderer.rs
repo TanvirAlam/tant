@@ -39,8 +39,15 @@ fn color_to_iced(color: vt100::Color) -> Color {
     }
 }
 
+fn bgcolor_to_iced(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => default_bg_color(), // Use ash gray for default background
+        _ => color_to_iced(color), // Use regular color mapping for explicit colors
+    }
+}
+
 fn default_bg_color() -> Color {
-    Color::from_rgb(0.0, 0.0, 0.0) // Black background
+    Color::from_rgb(0.15, 0.15, 0.15) // Dark ash gray background
 }
 
 impl TerminalRenderer {
@@ -135,7 +142,7 @@ impl Program<Message> for TerminalCanvas {
                     let display_width = if width > 1.0 { width * self.cell_width } else { self.cell_width };
 
                     // Draw background
-                    let bg = color_to_iced(cell.bgcolor());
+                    let bg = bgcolor_to_iced(cell.bgcolor());
                     frame.fill_rectangle(Point::new(x, y), Size::new(display_width, self.cell_height), bg);
 
                     // Draw text only if content is not empty
