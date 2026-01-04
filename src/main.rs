@@ -467,11 +467,9 @@ impl Application for Tant {
             Message::Resize(width, height) => {
                 let (cell_w, cell_h) = self.renderer.cell_size();
                 let cols = (width as f32 / cell_w) as u16;
-                // Subtract approximate UI height (top bar + input ~60px)
-                let terminal_height = height as f32 - 60.0;
-                let rows = (terminal_height / cell_h) as u16;
+                let rows = (height as f32 / cell_h) as u16;
                 let pixel_width = width as u16;
-                let pixel_height = terminal_height as u16;
+                let pixel_height = height as u16;
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
                         pane.parser.resize(rows, cols);
@@ -725,30 +723,6 @@ impl Application for Tant {
     }
 
     fn view(&self) -> Element<Message> {
-        // Top bar
-        let mut top_row = Row::new().spacing(3).padding([2, 5]);
-        let ai_toggle = Button::new(if self.ai_settings.enabled { "Disable AI" } else { "Enable AI" })
-            .on_press(Message::ToggleAiEnabled);
-        top_row = top_row.push(ai_toggle);
-
-        // AI buttons - only show if enabled
-        if self.ai_settings.enabled {
-            top_row = top_row
-                .push(Button::new("Explain").on_press(Message::AiExplainError))
-                .push(Button::new("Fix").on_press(Message::AiSuggestFix))
-                .push(Button::new("Cmd").on_press(Message::AiGenerateCommand))
-                .push(Button::new("Sum").on_press(Message::AiSummarizeOutput));
-        }
-
-        // Copy button if selection active
-        if let Some(tab) = self.layout.get(self.active_tab) {
-            if let Some(pane) = tab.panes.get(tab.active_pane) {
-                if pane.selection_start.is_some() {
-                    top_row = top_row.push(Button::new("Copy").on_press(Message::CopySelected));
-                }
-            }
-        }
-
         let layout_view = if let Some(tab) = self.layout.get(self.active_tab) {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
@@ -756,34 +730,7 @@ impl Application for Tant {
             self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, 0, None, None)
         };
 
-        // Text input for commands
-        let text_input = if let Some(tab) = self.layout.get(self.active_tab) {
-            if let Some(pane) = tab.panes.get(tab.active_pane) {
-                TextInput::new("Type command...", &pane.current_command)
-                    .on_input(Message::TerminalInput)
-                    .on_submit(Message::TerminalSubmit)
-                    .padding(3)
-                    .width(Length::Fill)
-            } else {
-                TextInput::new("Type command...", "")
-                    .on_input(Message::TerminalInput)
-                    .on_submit(Message::TerminalSubmit)
-                    .padding(3)
-                    .width(Length::Fill)
-            }
-        } else {
-            TextInput::new("Type command...", "")
-                .on_input(Message::TerminalInput)
-                .on_submit(Message::TerminalSubmit)
-                .padding(3)
-                .width(Length::Fill)
-        };
-
-        Column::new()
-            .push(top_row)
-            .push(text_input)
-            .push(layout_view)
-            .into()
+        layout_view
     }
 
     fn theme(&self) -> Theme {
