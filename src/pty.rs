@@ -55,8 +55,8 @@ impl PtyManager {
         &mut self.writer
     }
 
-    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Box<dyn std::error::Error>> {
-        self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+    pub fn resize(&mut self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) -> Result<(), Box<dyn std::error::Error>> {
+        self.master.resize(PtySize { rows, cols, pixel_width, pixel_height })?;
         Ok(())
     }
 }

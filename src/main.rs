@@ -423,11 +423,13 @@ impl Application for Tant {
                 let (cell_w, cell_h) = self.renderer.cell_size();
                 let cols = (width as f32 / cell_w) as u16;
                 let rows = (height as f32 / cell_h) as u16;
+                let pixel_width = width as u16;
+                let pixel_height = height as u16;
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
                         pane.parser.resize(rows, cols);
                         if let Ok(mut pty) = pane.pty.try_lock() {
-                            pty.resize(rows, cols).ok();
+                            pty.resize(rows, cols, pixel_width, pixel_height).ok();
                         }
                     }
                 }
