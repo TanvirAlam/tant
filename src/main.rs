@@ -110,6 +110,10 @@ pub enum Message {
     ToggleAiEnabled,
     UpdateAiSettings(AiSettings),
     Paste(String),
+    WindowFocused,
+    WindowUnfocused,
+    TerminalInput(String),
+    TerminalSubmit,
     None,
 }
 
@@ -278,7 +282,10 @@ impl Application for Tant {
             provider: "mock".to_string(),
             api_key: None,
         };
-        (Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None }, Command::none())
+        (
+            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None },
+            window::gain_focus(window::Id::MAIN)
+        )
     }
 
     fn title(&self) -> String {
@@ -290,11 +297,28 @@ impl Application for Tant {
             Message::Tick => {
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
-                        let mut buf = [0u8; 1024];
+                        let mut buf = [0u8; 4096];
                         if let Ok(mut pty) = pane.pty.try_lock() {
-                            if let Ok(n) = pty.reader().read(&mut buf) {
-                                if n > 0 {
-                                    pane.parser.process(&buf[..n]);
+                            loop {
+                                match pty.reader().read(&mut buf) {
+                                    Ok(0) => break, // EOF
+                                    Ok(n) => {
+                                        eprintln!("Read {} bytes from PTY", n);
+                                        pane.parser.process(&buf[..n]);
+                                        if n < buf.len() {
+                                            break; // No more data immediately available
+                                        }
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        break; // No data available
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                                        break; // Timeout
+                                    }
+                                    Err(e) => {
+                                        eprintln!("PTY read error: {:?}", e);
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -354,10 +378,12 @@ impl Application for Tant {
                 Command::none()
             }
             Message::KeyPress(key, modifiers) => {
+                eprintln!("KeyPress received: {:?} with modifiers: {:?}", key, modifiers);
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         if let Ok(mut pty) = pane.pty.try_lock() {
                             let bytes = Self::key_to_bytes(&key, &modifiers);
+                            eprintln!("Sending bytes: {:?}", bytes);
                             if !bytes.is_empty() {
                                 pty.writer().write_all(&bytes).ok();
                                 pty.writer().flush().ok();
@@ -368,6 +394,7 @@ impl Application for Tant {
                 Command::none()
             }
             Message::TextInput(text) => {
+                eprintln!("TextInput received: {:?}", text);
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         if let Ok(mut pty) = pane.pty.try_lock() {
@@ -503,40 +530,98 @@ impl Application for Tant {
                 Command::none()
             }
             Message::UpdateAiSettings(_) => Command::none(),
+            Message::WindowFocused => {
+                eprintln!("Window focused!");
+                Command::none()
+            }
+            Message::WindowUnfocused => {
+                eprintln!("Window unfocused!");
+                Command::none()
+            }
+            Message::TerminalInput(input) => {
+                // Update the current command text
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        pane.current_command = input;
+                    }
+                }
+                Command::none()
+            }
+            Message::TerminalSubmit => {
+                // Send the current command to PTY with enter
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        if let Ok(mut pty) = pane.pty.try_lock() {
+                            let cmd = format!("{}\r", pane.current_command);
+                            pty.writer().write_all(cmd.as_bytes()).ok();
+                            pty.writer().flush().ok();
+                            pane.current_command.clear();
+                        }
+                    }
+                }
+                Command::none()
+            }
             Message::PtyData(_) | Message::ParserEvents(_) | Message::None => Command::none(),
         }
     }
 
     fn view(&self) -> Element<Message> {
+        const EMPTY_STR: &str = "";
         if let Some(tab) = self.layout.get(self.active_tab) {
             if let Some(pane) = tab.panes.get(tab.active_pane) {
                 self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), &self.ai_settings, &self.ai_response)
             } else {
                 let dummy_parser = TerminalParser::new(24, 80);
-                self.renderer.view(&[], &None, &String::new(), &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response)
+                self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response)
             }
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, &String::new(), &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response)
+            self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response)
         }
+    }
+
+    fn theme(&self) -> Theme {
+        Theme::Dark
     }
 
     fn subscription(&self) -> Subscription<Message> {
         let time_sub = time::every(std::time::Duration::from_millis(10)).map(|_| Message::Tick);
         let event_sub = iced::event::listen().map(|event| {
+            eprintln!("Event received: {:?}", event);
             match event {
                 iced::Event::Window(_, window::Event::Resized { width, height }) => {
                     Message::Resize(width, height)
                 }
+                iced::Event::Window(_, window::Event::Focused) => {
+                    Message::WindowFocused
+                }
+                iced::Event::Window(_, window::Event::Unfocused) => {
+                    Message::WindowUnfocused
+                }
                 iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
-                    // If there's text and no modifiers (except shift), send as text
-                    if let Some(txt) = text {
-                        if !modifiers.control() && !modifiers.alt() && !modifiers.logo() {
-                            return Message::TextInput(txt.to_string());
-                        }
+                    eprintln!("Keyboard event - key: {:?}, modifiers: {:?}, text: {:?}", key, modifiers, text);
+                    
+                    // Handle special keys and modifiers first
+                    if modifiers.control() || modifiers.alt() || modifiers.logo() {
+                        eprintln!("Sending as KeyPress (with modifiers)");
+                        return Message::KeyPress(key.clone(), modifiers);
                     }
-                    // Otherwise handle as special key
-                    Message::KeyPress(key, modifiers)
+                    
+                    // Check if it's a named key (arrows, enter, etc.)
+                    if matches!(key, iced::keyboard::Key::Named(_)) {
+                        eprintln!("Sending as KeyPress (named key)");
+                        return Message::KeyPress(key.clone(), modifiers);
+                    }
+                    
+                    // For regular characters, prefer text field if available
+                    if let Some(txt) = text {
+                        eprintln!("Sending as TextInput: {:?}", txt);
+                        return Message::TextInput(txt.to_string());
+                    }
+                    
+                    // Fallback to key press
+                    eprintln!("Sending as KeyPress (fallback)");
+                    Message::KeyPress(key.clone(), modifiers)
                 }
                 _ => Message::None,
             }
@@ -546,5 +631,21 @@ impl Application for Tant {
 }
 
 fn main() -> iced::Result {
-    Tant::run(Settings::default())
+    Tant::run(Settings {
+        window: window::Settings {
+            size: iced::Size::new(1024.0, 768.0),
+            position: window::Position::default(),
+            min_size: None,
+            max_size: None,
+            visible: true,
+            resizable: true,
+            decorations: true,
+            transparent: false,
+            level: window::Level::Normal,
+            icon: None,
+            platform_specific: Default::default(),
+            exit_on_close_request: true,
+        },
+        ..Settings::default()
+    })
 }

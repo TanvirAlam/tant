@@ -1,6 +1,6 @@
 // Renderer + UI shell
 
-use iced::widget::{Canvas, Column, Row, Button, Text, Scrollable};
+use iced::widget::{Canvas, Column, Row, Button, TextInput};
 use iced::{Element, Length, Color, Point, Size, Rectangle, Theme, Pixels, Font};
 use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
@@ -52,7 +52,8 @@ impl TerminalRenderer {
         (8.0, 16.0)
     }
 
-    pub fn view<'a>(&self, _history: &'a [Block], _current: &Option<Block>, _current_command: &str, _search_query: &str, screen: &vt100::Screen, ai_settings: &'a AiSettings, ai_response: &'a Option<String>) -> Element<'a, Message> {
+    pub fn view<'a>(&self, _history: &'a [Block], _current: &Option<Block>, current_command: &'a str, _search_query: &str, screen: &vt100::Screen, ai_settings: &'a AiSettings, _ai_response: &'a Option<String>) -> Element<'a, Message> {
+        // Terminal canvas - absolute full width and height
         let canvas = Canvas::new(TerminalCanvas {
             screen: screen.clone(),
             cell_width: 8.0,
@@ -61,32 +62,43 @@ impl TerminalRenderer {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        let mut column = Column::new().spacing(10);
+        // Simple column with minimal spacing
+        let mut main_column = Column::new()
+            .spacing(0)
+            .padding(0)
+            .width(Length::Fill)
+            .height(Length::Fill);
 
-        // AI toggle
-        let ai_toggle = Button::new(if ai_settings.enabled { "Disable AI" } else { "Enable AI" }).on_press(Message::ToggleAiEnabled);
-        column = column.push(ai_toggle);
+        // Top bar with AI controls - minimal
+        let mut top_row = Row::new().spacing(3).padding([2, 5]);
+        let ai_toggle = Button::new(if ai_settings.enabled { "Disable AI" } else { "Enable AI" })
+            .on_press(Message::ToggleAiEnabled);
+        top_row = top_row.push(ai_toggle);
 
-        // AI buttons
+        // AI buttons - only show if enabled
         if ai_settings.enabled {
-            let ai_row = Row::new().spacing(10)
-                .push(Button::new("Explain Error").on_press(Message::AiExplainError))
-                .push(Button::new("Suggest Fix").on_press(Message::AiSuggestFix))
-                .push(Button::new("Generate Command").on_press(Message::AiGenerateCommand))
-                .push(Button::new("Summarize Output").on_press(Message::AiSummarizeOutput));
-            column = column.push(ai_row);
+            top_row = top_row
+                .push(Button::new("Explain").on_press(Message::AiExplainError))
+                .push(Button::new("Fix").on_press(Message::AiSuggestFix))
+                .push(Button::new("Cmd").on_press(Message::AiGenerateCommand))
+                .push(Button::new("Sum").on_press(Message::AiSummarizeOutput));
         }
+        
+        main_column = main_column.push(top_row);
+        
+        // Text input for commands
+        let text_input = TextInput::new("Type command...", current_command)
+            .on_input(Message::TerminalInput)
+            .on_submit(Message::TerminalSubmit)
+            .padding(3)
+            .width(Length::Fill);
+        
+        main_column = main_column.push(text_input);
 
-        column = column.push(canvas);
+        // Terminal canvas - this should take ALL remaining vertical space
+        main_column = main_column.push(canvas);
 
-        // AI response
-        if let Some(response) = ai_response {
-            let response_text = Text::new(response);
-            let scrollable = Scrollable::new(response_text);
-            column = column.push(scrollable);
-        }
-
-        column.into()
+        main_column.into()
     }
 }
 
@@ -108,6 +120,8 @@ impl Program<Message> for TerminalCanvas {
         let size = self.screen.size();
         let rows = size.1 as usize;
         let cols = size.0 as usize;
+        
+        eprintln!("Canvas bounds: {:?}, Screen size: {}x{}", bounds, cols, rows);
 
         for row in 0..rows {
             for col in 0..cols {

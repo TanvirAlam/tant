@@ -2,14 +2,15 @@
 // Spawn the user's shell inside a pseudo-terminal
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{Read, Write};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
 pub struct PtyManager {
     master: Box<dyn portable_pty::MasterPty + Send>,
     #[allow(dead_code)]
     child: Box<dyn portable_pty::Child + Send>,
-    reader: BufReader<Box<dyn Read + Send>>,
-    writer: BufWriter<Box<dyn Write + Send>>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
 }
 
 impl PtyManager {
@@ -25,11 +26,19 @@ impl PtyManager {
             pixel_width: 0,
             pixel_height: 0,
         })?;
+        
+        // Set the master PTY to non-blocking mode
+        if let Some(fd) = pair.master.as_raw_fd() {
+            let flags = fcntl(fd, FcntlArg::F_GETFL)?;
+            let oflags = OFlag::from_bits_truncate(flags);
+            fcntl(fd, FcntlArg::F_SETFL(oflags | OFlag::O_NONBLOCK))?;
+        }
+        
         let mut cmd = CommandBuilder::new(shell);
         cmd.cwd(cwd);
         let child = pair.slave.spawn_command(cmd)?;
-        let reader = BufReader::new(pair.master.try_clone_reader()?);
-        let writer = BufWriter::new(pair.master.take_writer()?);
+        let reader = pair.master.try_clone_reader()?;
+        let writer = pair.master.take_writer()?;
         Ok(PtyManager {
             master: pair.master,
             child,
