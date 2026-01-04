@@ -4,6 +4,7 @@ use iced::widget::{Row, Column, Button, TextInput, container};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
+use chrono::{DateTime, Utc};
 
 mod pty;
 mod parser;
@@ -16,16 +17,18 @@ use pty::PtyManager;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
     pub command: String,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub duration_ms: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub cwd: Option<std::path::PathBuf>,
+    pub output_range: Option<(usize, usize)>,
+    pub pinned: bool,
+    pub tags: Vec<String>,
+    // Keep output for now, until shared store is implemented
     pub output: String,
-    pub status: Option<i32>,
-    #[serde(skip, default)]
-    pub start_time: Option<std::time::Instant>,
-    #[serde(skip, default)]
-    pub duration: Option<std::time::Duration>,
-    pub directory: String,
     pub git_branch: Option<String>,
     pub host: String,
-    pub pinned: bool,
 }
 
 pub struct Pane {
@@ -264,7 +267,7 @@ impl Tant {
                 if self.ai_settings.send_last_n_blocks > 0 {
                     let start = pane.history.len().saturating_sub(last_n);
                     for block in &pane.history[start..] {
-                        data.push_str(&format!("Command: {}\nOutput: {}\nStatus: {:?}\n\n", block.command, block.output, block.status));
+                        data.push_str(&format!("Command: {}\nOutput: {}\nExit Code: {:?}\n\n", block.command, block.output, block.exit_code));
                     }
                 }
                 // Repo context not implemented yet
@@ -368,21 +371,25 @@ impl Application for Tant {
                                 }
                                 ParserEvent::CommandStart => {
                                     if let Some(mut block) = pane.current_block.take() {
-                                        if let Some(start) = block.start_time {
-                                            block.duration = Some(start.elapsed());
+                                        if let Some(start) = block.started_at {
+                                            block.ended_at = Some(Utc::now());
+                                            block.duration_ms = Some((Utc::now() - start).num_milliseconds() as u64);
                                         }
                                         pane.history.push(block);
                                     }
                                     pane.current_block = Some(Block {
                                         command: String::new(),
+                                        started_at: Some(Utc::now()),
+                                        ended_at: None,
+                                        duration_ms: None,
+                                        exit_code: None,
+                                        cwd: Some(std::path::PathBuf::from(&pane.working_directory)),
+                                        output_range: None,
+                                        pinned: false,
+                                        tags: vec![],
                                         output: String::new(),
-                                        status: None,
-                                        start_time: Some(std::time::Instant::now()),
-                                        duration: None,
-                                        directory: pane.working_directory.clone(),
                                         git_branch: None,
                                         host: "localhost".to_string(), // TODO: get actual host
-                                        pinned: false,
                                     });
                                     eprintln!("[Block Detection] Command started - new block created");
                                 }
@@ -393,7 +400,7 @@ impl Application for Tant {
                                 }
                                 ParserEvent::Directory(dir) => {
                                     if let Some(ref mut block) = pane.current_block {
-                                        block.directory = dir.clone();
+                                        block.cwd = Some(std::path::PathBuf::from(&dir));
                                         pane.working_directory = dir;
                                     }
                                 }
@@ -404,9 +411,10 @@ impl Application for Tant {
                                 }
                                 ParserEvent::CommandEnd(status) => {
                                     if let Some(mut block) = pane.current_block.take() {
-                                        block.status = Some(status);
-                                        if let Some(start) = block.start_time {
-                                            block.duration = Some(start.elapsed());
+                                        block.exit_code = Some(status);
+                                        if let Some(start) = block.started_at {
+                                            block.ended_at = Some(Utc::now());
+                                            block.duration_ms = Some((Utc::now() - start).num_milliseconds() as u64);
                                         }
                                         block.output = pane.parser.screen_text();
                                         pane.history.push(block);
