@@ -59,12 +59,13 @@ impl TerminalRenderer {
         (8.0, 16.0)
     }
 
-    pub fn view<'a>(&self, _history: &'a [Block], _current: &Option<Block>, current_command: &'a str, _search_query: &str, screen: &vt100::Screen, ai_settings: &'a AiSettings, _ai_response: &'a Option<String>) -> Element<'a, Message> {
+    pub fn view<'a>(&self, _history: &'a [Block], _current: &Option<Block>, current_command: &'a str, _search_query: &str, screen: &vt100::Screen, ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, scroll_offset: usize) -> Element<'a, Message> {
         // Terminal canvas - absolute full width and height
         let canvas = Canvas::new(TerminalCanvas {
             screen: screen.clone(),
             cell_width: 8.0,
             cell_height: 16.0,
+            scroll_offset,
         })
         .width(Length::Fill)
         .height(Length::Fill);
@@ -113,6 +114,7 @@ pub struct TerminalCanvas {
     pub screen: vt100::Screen,
     pub cell_width: f32,
     pub cell_height: f32,
+    pub scroll_offset: usize,
 }
 
 impl Program<Message> for TerminalCanvas {
@@ -124,41 +126,25 @@ impl Program<Message> for TerminalCanvas {
         // Fill with default background
         frame.fill_rectangle(Point::ORIGIN, bounds.size(), default_bg_color());
 
-        let size = self.screen.size();
-        let rows = size.1 as usize;
-        let cols = size.0 as usize;
-        
-        eprintln!("Canvas bounds: {:?}, Screen size: {}x{}", bounds, cols, rows);
+        let visible_rows = (bounds.height / self.cell_height) as usize;
+        let contents = self.screen.contents();
+        let lines: Vec<&str> = contents.lines().collect();
+        let total_lines = lines.len();
+        let start_line = total_lines.saturating_sub(visible_rows + self.scroll_offset);
 
-        for row in 0..rows {
-            for col in 0..cols {
-                if let Some(cell) = self.screen.cell(row as u16, col as u16) {
-                    let x = col as f32 * self.cell_width;
-                    let y = row as f32 * self.cell_height;
+        eprintln!("Canvas bounds: {:?}, Total lines: {}, Start line: {}, Scroll offset: {}", bounds, total_lines, start_line, self.scroll_offset);
 
-                    // Calculate display width
-                    let content = cell.contents();
-                    let width = content.width() as f32;
-                    let display_width = if width > 1.0 { width * self.cell_width } else { self.cell_width };
-
-                    // Draw background
-                    let bg = bgcolor_to_iced(cell.bgcolor());
-                    frame.fill_rectangle(Point::new(x, y), Size::new(display_width, self.cell_height), bg);
-
-                    // Draw text only if content is not empty
-                    if !content.is_empty() && content != " " {
-                        let fg = color_to_iced(cell.fgcolor());
-                        let text = canvas::Text {
-                            content: content.into(),
-                            position: Point::new(x, y),
-                            size: Pixels(self.cell_height),
-                            color: fg,
-                            font: Font::MONOSPACE,
-                            ..canvas::Text::default()
-                        };
-                        frame.fill_text(text);
-                    }
-                }
+        for y in 0..visible_rows {
+            if let Some(line) = lines.get(start_line + y) {
+                let text = canvas::Text {
+                    content: line.to_string(),
+                    position: Point::new(0.0, y as f32 * self.cell_height),
+                    size: Pixels(self.cell_height),
+                    color: Color::from_rgb(0.9, 0.9, 0.9),
+                    font: Font::MONOSPACE,
+                    ..canvas::Text::default()
+                };
+                frame.fill_text(text);
             }
         }
 

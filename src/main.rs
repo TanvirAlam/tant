@@ -1,4 +1,4 @@
-use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window};
+use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse};
 use iced::keyboard::{self, Key, Modifiers};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -114,6 +114,7 @@ pub enum Message {
     WindowUnfocused,
     TerminalInput(String),
     TerminalSubmit,
+    MouseWheel(mouse::ScrollDelta),
     None,
 }
 
@@ -124,6 +125,8 @@ struct Tant {
     search_query: String,
     ai_settings: AiSettings,
     ai_response: Option<String>,
+    scroll_offset: usize,
+    follow_mode: bool,
 }
 
 impl Tant {
@@ -283,7 +286,7 @@ impl Application for Tant {
             api_key: None,
         };
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None },
+            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None, scroll_offset: 0, follow_mode: true },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -295,6 +298,7 @@ impl Application for Tant {
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::Tick => {
+                let mut has_new_data = false;
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
                         let mut buf = [0u8; 4096];
@@ -305,6 +309,7 @@ impl Application for Tant {
                                     Ok(n) => {
                                         eprintln!("Read {} bytes from PTY", n);
                                         pane.parser.process(&buf[..n]);
+                                        has_new_data = true;
                                         if n < buf.len() {
                                             break; // No more data immediately available
                                         }
@@ -374,6 +379,10 @@ impl Application for Tant {
                             }
                         }
                     }
+                }
+                // If follow mode and new data, scroll to bottom
+                if has_new_data && self.follow_mode {
+                    self.scroll_offset = 0;
                 }
                 Command::none()
             }
@@ -563,6 +572,43 @@ impl Application for Tant {
                 }
                 Command::none()
             }
+            Message::MouseWheel(delta) => {
+                match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => {
+                        if y > 0.0 {
+                            // Scroll up (show older content)
+                            if self.scroll_offset < usize::MAX / 2 { // Prevent overflow
+                                self.scroll_offset += y.abs() as usize;
+                                self.follow_mode = false;
+                            }
+                        } else if y < 0.0 {
+                            // Scroll down (show newer content)
+                            if self.scroll_offset > 0 {
+                                self.scroll_offset = self.scroll_offset.saturating_sub(y.abs() as usize);
+                                if self.scroll_offset == 0 {
+                                    self.follow_mode = true;
+                                }
+                            }
+                        }
+                    }
+                    mouse::ScrollDelta::Pixels { y, .. } => {
+                        // Convert pixels to lines, assuming cell_height
+                        let lines = (y.abs() / 16.0) as usize;
+                        if y > 0.0 {
+                            if self.scroll_offset < usize::MAX / 2 {
+                                self.scroll_offset += lines;
+                                self.follow_mode = false;
+                            }
+                        } else if y < 0.0 && self.scroll_offset > 0 {
+                            self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+                            if self.scroll_offset == 0 {
+                                self.follow_mode = true;
+                            }
+                        }
+                    }
+                }
+                Command::none()
+            }
             Message::PtyData(_) | Message::ParserEvents(_) | Message::None => Command::none(),
         }
     }
@@ -571,14 +617,14 @@ impl Application for Tant {
         const EMPTY_STR: &str = "";
         if let Some(tab) = self.layout.get(self.active_tab) {
             if let Some(pane) = tab.panes.get(tab.active_pane) {
-                self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), &self.ai_settings, &self.ai_response)
+                self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset)
             } else {
                 let dummy_parser = TerminalParser::new(24, 80);
-                self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response)
+                self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset)
             }
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response)
+            self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset)
         }
     }
 
@@ -599,6 +645,9 @@ impl Application for Tant {
                 }
                 iced::Event::Window(_, window::Event::Unfocused) => {
                     Message::WindowUnfocused
+                }
+                iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                    Message::MouseWheel(delta)
                 }
                 iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
                     eprintln!("Keyboard event - key: {:?}, modifiers: {:?}, text: {:?}", key, modifiers, text);

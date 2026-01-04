@@ -15,14 +15,13 @@ pub enum ParserEvent {
 pub struct TerminalParser {
     parser: Parser,
     events: Vec<ParserEvent>,
-    scroll_offset: usize,
     dirty: bool,
 }
 
 impl TerminalParser {
     pub fn new(rows: u16, cols: u16) -> Self {
         let parser = Parser::new(rows, cols, 1000); // Large scrollback
-        TerminalParser { parser, events: vec![], scroll_offset: 0, dirty: true }
+        TerminalParser { parser, events: vec![], dirty: true }
     }
 
     pub fn process(&mut self, data: &[u8]) {
@@ -56,13 +55,6 @@ impl TerminalParser {
             text.push('\n');
         }
         text
-    }
-    pub fn scroll_offset(&self) -> usize {
-        self.scroll_offset
-    }
-    pub fn set_scroll_offset(&mut self, offset: usize) {
-        self.scroll_offset = offset;
-        self.dirty = true;
     }
     pub fn is_dirty(&self) -> bool {
         self.dirty
