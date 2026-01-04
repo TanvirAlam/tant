@@ -34,6 +34,7 @@ pub struct Pane {
     pub current_block: Option<Block>,
     pub current_command: String,
     pub working_directory: String,
+    pub data_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,7 +74,9 @@ pub struct AiSettings {
 impl Pane {
     pub fn new(shell: &str, working_directory: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
         let wd = working_directory.unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
+        let (sender, receiver) = tokio::sync::mpsc::channel(100); // Buffer size
         let pty = PtyManager::new_with_cwd(shell, std::path::PathBuf::from(&wd))?;
+        pty.spawn_reader(sender);
         let parser = TerminalParser::new(24, 80);
         Ok(Pane {
             pty: Arc::new(TokioMutex::new(pty)),
@@ -82,6 +85,7 @@ impl Pane {
             current_block: None,
             current_command: String::new(),
             working_directory: wd,
+            data_receiver: receiver,
         })
     }
 }
@@ -317,31 +321,11 @@ impl Application for Tant {
                 let mut has_new_data = false;
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
-                        let mut buf = [0u8; 4096];
-                        if let Ok(mut pty) = pane.pty.try_lock() {
-                            loop {
-                                match pty.reader().read(&mut buf) {
-                                    Ok(0) => break, // EOF
-                                    Ok(n) => {
-                                        eprintln!("Read {} bytes from PTY", n);
-                                        pane.parser.process(&buf[..n]);
-                                        has_new_data = true;
-                                        if n < buf.len() {
-                                            break; // No more data immediately available
-                                        }
-                                    }
-                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                        break; // No data available
-                                    }
-                                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                                        break; // Timeout
-                                    }
-                                    Err(e) => {
-                                        eprintln!("PTY read error: {:?}", e);
-                                        break;
-                                    }
-                                }
-                            }
+                        // Receive data from the async reader
+                        while let Ok(data) = pane.data_receiver.try_recv() {
+                            eprintln!("Received {} bytes from PTY", data.len());
+                            pane.parser.process(&data);
+                            has_new_data = true;
                         }
                         // Handle parser events
                         let events = pane.parser.take_events();

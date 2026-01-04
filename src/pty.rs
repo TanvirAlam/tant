@@ -59,4 +59,26 @@ impl PtyManager {
         self.master.resize(PtySize { rows, cols, pixel_width, pixel_height })?;
         Ok(())
     }
+
+    pub fn spawn_reader(&self, sender: tokio::sync::mpsc::Sender<Vec<u8>>) {
+        let mut reader = self.master.try_clone_reader().expect("Failed to clone reader");
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let data = buf[..n].to_vec();
+                        if sender.send(data).await.is_err() {
+                            break; // Receiver dropped
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 }
