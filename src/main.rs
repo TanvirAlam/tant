@@ -1,6 +1,6 @@
 use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse, clipboard, Point, Length, Color};
 use iced::keyboard::{self, Key, Modifiers};
-use iced::widget::{Row, Column, container};
+use iced::widget::{Row, Column, container, TextInput};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -91,6 +91,17 @@ pub enum Axis {
     Vertical,
 }
 
+#[derive(Debug, Clone)]
+pub enum PaletteAction {
+    SplitPaneHorizontal,
+    SplitPaneVertical,
+    ClosePane,
+    SwitchTab(usize),
+    RunPinnedCommand(usize),
+    ToggleAi,
+    // Add more as needed
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LayoutNode {
     Split {
@@ -164,6 +175,11 @@ pub enum Message {
     MouseCursorMoved(Point),
     MouseButtonReleased(mouse::Button),
     CopySelected,
+    OpenCommandPalette,
+    CloseCommandPalette,
+    UpdatePaletteQuery(String),
+    UpdatePaletteSelection(isize),
+    ExecutePaletteAction(PaletteAction),
     None,
 }
 
@@ -174,6 +190,9 @@ struct Tant {
     search_query: String,
     ai_settings: AiSettings,
     ai_response: Option<String>,
+    show_command_palette: bool,
+    palette_query: String,
+    palette_selected: usize,
 }
 
 impl Tant {
@@ -291,6 +310,106 @@ impl Tant {
             _ => format!("AI Response: {}\n\n{}", action, prompt),
         }
     }
+
+    fn execute_palette_action(&mut self, action: PaletteAction) {
+        match action {
+            PaletteAction::SplitPaneHorizontal => {
+                // TODO: Implement split pane
+                eprintln!("Split pane horizontal");
+            }
+            PaletteAction::SplitPaneVertical => {
+                // TODO: Implement split pane
+                eprintln!("Split pane vertical");
+            }
+            PaletteAction::ClosePane => {
+                // TODO: Implement close pane
+                eprintln!("Close pane");
+            }
+            PaletteAction::SwitchTab(index) => {
+                if index < self.layout.len() {
+                    self.active_tab = index;
+                }
+            }
+            PaletteAction::RunPinnedCommand(index) => {
+                if let Some(tab) = self.layout.get(self.active_tab) {
+                    if let Some(pane) = tab.panes.get(tab.active_pane) {
+                        if let Some(block) = pane.history.get(index) {
+                            if block.pinned {
+                                let _cmd = format!("{}\n", block.command);
+                                // TODO: Send to current pane
+                                eprintln!("Run pinned command: {}", block.command);
+                            }
+                        }
+                    }
+                }
+            }
+            PaletteAction::ToggleAi => {
+                self.ai_settings.enabled = !self.ai_settings.enabled;
+            }
+        }
+    }
+
+    fn render_command_palette(&self) -> Element<Message> {
+        let actions = self.get_available_actions();
+        let filtered_actions: Vec<_> = actions.iter()
+            .filter(|(name, _)| name.to_lowercase().contains(&self.palette_query.to_lowercase()))
+            .collect();
+
+        let mut column = Column::new().spacing(5).padding(20);
+
+        // Search input
+        let search_input = TextInput::new("Search commands...", &self.palette_query)
+            .on_input(Message::UpdatePaletteQuery)
+            .padding(10);
+        column = column.push(search_input);
+
+        // Action list
+        for (index, (name, action)) in filtered_actions.iter().enumerate() {
+            let is_selected = index == self.palette_selected;
+            let mut text = iced::widget::Text::new(*name);
+            if is_selected {
+                text = text.style(Color::from_rgb(0.4, 0.7, 0.9));
+            }
+            let button = iced::widget::Button::new(text)
+                .on_press(Message::ExecutePaletteAction((*action).clone()))
+                .padding(5);
+            column = column.push(button);
+        }
+
+        container(column)
+            .center_x()
+            .center_y()
+            .width(Length::Fixed(400.0))
+            .height(Length::Fixed(300.0))
+            .into()
+    }
+
+    fn get_available_actions(&self) -> Vec<(&str, PaletteAction)> {
+        let mut actions = vec![
+            ("Split Pane Horizontal", PaletteAction::SplitPaneHorizontal),
+            ("Split Pane Vertical", PaletteAction::SplitPaneVertical),
+            ("Close Pane", PaletteAction::ClosePane),
+            ("Toggle AI", PaletteAction::ToggleAi),
+        ];
+
+        // Add switch tab actions
+        for i in 0..self.layout.len() {
+            actions.push((Box::leak(format!("Switch to Tab {}", i + 1).into_boxed_str()), PaletteAction::SwitchTab(i)));
+        }
+
+        // Add pinned commands
+        if let Some(tab) = self.layout.get(self.active_tab) {
+            if let Some(pane) = tab.panes.get(tab.active_pane) {
+                for (index, block) in pane.history.iter().enumerate() {
+                    if block.pinned {
+                        actions.push((Box::leak(format!("Run: {}", block.command).into_boxed_str()), PaletteAction::RunPinnedCommand(index)));
+                    }
+                }
+            }
+        }
+
+        actions
+    }
 }
 
 impl Application for Tant {
@@ -336,7 +455,7 @@ impl Application for Tant {
             api_key: None,
         };
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None },
+            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0 },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -758,6 +877,39 @@ impl Application for Tant {
                 }
                 Command::none()
             }
+            Message::OpenCommandPalette => {
+                self.show_command_palette = true;
+                self.palette_query.clear();
+                self.palette_selected = 0;
+                Command::none()
+            }
+            Message::CloseCommandPalette => {
+                self.show_command_palette = false;
+                Command::none()
+            }
+            Message::UpdatePaletteQuery(query) => {
+                self.palette_query = query;
+                self.palette_selected = 0; // Reset selection
+                Command::none()
+            }
+            Message::UpdatePaletteSelection(delta) => {
+                let actions = self.get_available_actions();
+                let filtered_count = actions.iter()
+                    .filter(|(name, _)| name.to_lowercase().contains(&self.palette_query.to_lowercase()))
+                    .count();
+                if filtered_count > 0 {
+                    self.palette_selected = ((self.palette_selected as isize + delta) % filtered_count as isize) as usize;
+                    if self.palette_selected >= filtered_count {
+                        self.palette_selected = filtered_count - 1;
+                    }
+                }
+                Command::none()
+            }
+            Message::ExecutePaletteAction(action) => {
+                self.show_command_palette = false;
+                self.execute_palette_action(action);
+                Command::none()
+            }
             Message::PtyData(_) | Message::ParserEvents(_) | Message::None => Command::none(),
         }
     }
@@ -770,7 +922,11 @@ impl Application for Tant {
             self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None)
         };
 
-        layout_view
+        if self.show_command_palette {
+            self.render_command_palette()
+        } else {
+            layout_view
+        }
     }
 
     fn theme(&self) -> Theme {
@@ -815,19 +971,25 @@ impl Application for Tant {
                 }
                 iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
                     eprintln!("Keyboard event - key: {:?}, modifiers: {:?}, text: {:?}", key, modifiers, text);
-                    
+
+
+                    // Check for command palette shortcut (Ctrl+K)
+                    if modifiers.control() && matches!(key, iced::keyboard::Key::Character(ref c) if c == "k") {
+                        return Message::OpenCommandPalette;
+                    }
+
                     // Handle special keys and modifiers first
                     if modifiers.control() || modifiers.alt() || modifiers.logo() {
                         eprintln!("Sending as KeyPress (with modifiers)");
                         return Message::KeyPress(key.clone(), modifiers);
                     }
-                    
+
                     // Check if it's a named key (arrows, enter, etc.) but NOT Space
                     if matches!(key, iced::keyboard::Key::Named(_)) {
                         eprintln!("Sending as KeyPress (named key)");
                         return Message::KeyPress(key.clone(), modifiers);
                     }
-                    
+
                     // For regular characters (including space), prefer text field if available
                     if let Some(txt) = text {
                         if !txt.is_empty() {
@@ -835,13 +997,13 @@ impl Application for Tant {
                             return Message::TextInput(txt.to_string());
                         }
                     }
-                    
+
                     // Special handling for space if text is empty
                     if matches!(&key, iced::keyboard::Key::Character(c) if c == " ") {
                         eprintln!("Sending space character");
                         return Message::TextInput(" ".to_string());
                     }
-                    
+
                     // Fallback to key press
                     eprintln!("Sending as KeyPress (fallback) for key: {:?}", key);
                     Message::KeyPress(key.clone(), modifiers)
