@@ -1,4 +1,6 @@
 use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window};
+use serde::{Deserialize, Serialize};
+use portable_pty::{CommandBuilder, PtySize, PtySystem};
 
 mod pty;
 mod parser;
@@ -7,18 +9,96 @@ mod renderer;
 use pty::PtyManager;
 use parser::{TerminalParser, ParserEvent};
 use renderer::TerminalRenderer;
+use vt100::Screen;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
     pub command: String,
     pub output: String,
     pub status: Option<i32>,
-    pub start_time: std::time::Instant,
+    #[serde(skip, default)]
+    pub start_time: Option<std::time::Instant>,
+    #[serde(skip, default)]
     pub duration: Option<std::time::Duration>,
     pub directory: String,
     pub git_branch: Option<String>,
     pub host: String,
     pub pinned: bool,
+}
+
+pub struct Pane {
+    pub pty: PtyManager,
+    pub parser: TerminalParser,
+    pub history: Vec<Block>,
+    pub current_block: Option<Block>,
+    pub current_command: String,
+    pub working_directory: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SerializablePane {
+    pub history: Vec<Block>,
+    pub current_command: String,
+    pub working_directory: String,
+}
+
+pub struct Tab {
+    pub panes: Vec<Pane>,
+    pub active_pane: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SerializableTab {
+    pub panes: Vec<SerializablePane>,
+    pub active_pane: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Layout {
+    pub tabs: Vec<SerializableTab>,
+    pub active_tab: usize,
+}
+
+impl Pane {
+    pub fn new(shell: &str, working_directory: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
+        let wd = working_directory.unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
+        let pty = PtyManager::new_with_cwd(shell, &wd)?;
+        let parser = TerminalParser::new(24, 80);
+        Ok(Pane {
+            pty,
+            parser,
+            history: vec![],
+            current_block: None,
+            current_command: String::new(),
+            working_directory: wd,
+        })
+    }
+}
+
+impl PtyManager {
+    pub fn new_with_cwd(shell: &str, cwd: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let pty_system = PtySystem::default();
+        #[cfg(windows)]
+        let pty_system = PtySystem::default();
+        let pair = pty_system.openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.cwd(cwd);
+        let child = pair.slave.spawn_command(cmd)?;
+        let reader = pair.master.input;
+        let writer = pair.master.output;
+        Ok(PtyManager {
+            master: pair.master,
+            child,
+            reader,
+            writer,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -34,17 +114,45 @@ pub enum Message {
     RunCurrent,
     UpdateSearch(String),
     TogglePin(usize),
+    SaveSession,
     None,
 }
 
 struct Tant {
-    pty: PtyManager,
-    parser: TerminalParser,
+    layout: Vec<Tab>,
+    active_tab: usize,
     renderer: TerminalRenderer,
-    history: Vec<Block>,
-    current_block: Option<Block>,
-    current_command: String,
     search_query: String,
+}
+
+impl Tant {
+    fn save_session(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let serializable_tabs: Vec<SerializableTab> = self.layout.iter().map(|tab| {
+            SerializableTab {
+                panes: tab.panes.iter().map(|pane| {
+                    SerializablePane {
+                        history: pane.history.clone(),
+                        current_command: pane.current_command.clone(),
+                        working_directory: pane.working_directory.clone(),
+                    }
+                }).collect(),
+                active_pane: tab.active_pane,
+            }
+        }).collect();
+        let layout = Layout {
+            tabs: serializable_tabs,
+            active_tab: self.active_tab,
+        };
+        let json = serde_json::to_string(&layout)?;
+        std::fs::write("session.json", json)?;
+        Ok(())
+    }
+
+    fn load_session() -> Result<Layout, Box<dyn std::error::Error>> {
+        let json = std::fs::read_to_string("session.json")?;
+        let layout: Layout = serde_json::from_str(&json)?;
+        Ok(layout)
+    }
 }
 
 impl Application for Tant {
@@ -54,10 +162,32 @@ impl Application for Tant {
     type Flags = ();
 
     fn new(_flags: ()) -> (Self, Command<Message>) {
-        let pty = PtyManager::new("bash").unwrap();
-        let parser = TerminalParser::new(24, 80);
+        let (layout, active_tab) = if let Ok(saved_layout) = Self::load_session() {
+            // Restore from saved session
+            let mut tabs = vec![];
+            for saved_tab in saved_layout.tabs {
+                let mut panes = vec![];
+                for saved_pane in saved_tab.panes {
+                    let pane = Pane::new("bash", Some(saved_pane.working_directory.clone())).unwrap();
+                    // Restore history and current_command
+                    let mut pane = pane;
+                    pane.history = saved_pane.history;
+                    pane.current_command = saved_pane.current_command;
+                    pane.working_directory = saved_pane.working_directory;
+                    panes.push(pane);
+                }
+                let tab = Tab { panes, active_pane: saved_tab.active_pane };
+                tabs.push(tab);
+            }
+            (tabs, saved_layout.active_tab)
+        } else {
+            // Default
+            let pane = Pane::new("bash", None).unwrap();
+            let tab = Tab { panes: vec![pane], active_pane: 0 };
+            (vec![tab], 0)
+        };
         let renderer = TerminalRenderer::new();
-        (Tant { pty, parser, renderer, history: vec![], current_block: None, current_command: String::new(), search_query: String::new() }, Command::none())
+        (Tant { layout, active_tab, renderer, search_query: String::new() }, Command::none())
     }
 
     fn title(&self) -> String {
@@ -67,58 +197,67 @@ impl Application for Tant {
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::Tick => {
-                // Read from PTY synchronously
                 let rt = tokio::runtime::Handle::current();
-                let mut buf = vec![0u8; 1024];
-                let n = rt.block_on(async {
-                    use tokio::io::AsyncReadExt;
-                    self.pty.reader().read(&mut buf).await.unwrap_or(0)
-                });
-                if n > 0 {
-                    self.parser.process(&buf[..n]);
-                }
-                // Handle parser events
-                let events = self.parser.take_events();
-                for event in events {
-                    match event {
-                        ParserEvent::CommandStart => {
-                            if let Some(mut block) = self.current_block.take() {
-                                block.duration = Some(block.start_time.elapsed());
-                                self.history.push(block);
-                            }
-                            self.current_block = Some(Block {
-                                command: String::new(),
-                                output: String::new(),
-                                status: None,
-                                start_time: std::time::Instant::now(),
-                                duration: None,
-                                directory: std::env::current_dir().unwrap().to_string_lossy().to_string(),
-                                git_branch: None,
-                                host: "localhost".to_string(), // TODO: get actual host
-                                pinned: false,
-                            });
+                for tab in &mut self.layout {
+                    for pane in &mut tab.panes {
+                        // Read from PTY
+                        let mut buf = vec![0u8; 1024];
+                        let n = rt.block_on(async {
+                            use tokio::io::AsyncReadExt;
+                            pane.pty.reader().read(&mut buf).await.unwrap_or(0)
+                        });
+                        if n > 0 {
+                            pane.parser.process(&buf[..n]);
                         }
-                        ParserEvent::Command(cmd) => {
-                            if let Some(ref mut block) = self.current_block {
-                                block.command = cmd;
-                            }
-                        }
-                        ParserEvent::Directory(dir) => {
-                            if let Some(ref mut block) = self.current_block {
-                                block.directory = dir;
-                            }
-                        }
-                        ParserEvent::GitBranch(branch) => {
-                            if let Some(ref mut block) = self.current_block {
-                                block.git_branch = Some(branch);
-                            }
-                        }
-                        ParserEvent::CommandEnd(status) => {
-                            if let Some(mut block) = self.current_block.take() {
-                                block.status = Some(status);
-                                block.duration = Some(block.start_time.elapsed());
-                                block.output = self.parser.screen_text();
-                                self.history.push(block);
+                        // Handle parser events
+                        let events = pane.parser.take_events();
+                        for event in events {
+                            match event {
+                                ParserEvent::CommandStart => {
+                                    if let Some(mut block) = pane.current_block.take() {
+                                        if let Some(start) = block.start_time {
+                                            block.duration = Some(start.elapsed());
+                                        }
+                                        pane.history.push(block);
+                                    }
+                                    pane.current_block = Some(Block {
+                                        command: String::new(),
+                                        output: String::new(),
+                                        status: None,
+                                        start_time: Some(std::time::Instant::now()),
+                                        duration: None,
+                                        directory: pane.working_directory.clone(),
+                                        git_branch: None,
+                                        host: "localhost".to_string(), // TODO: get actual host
+                                        pinned: false,
+                                    });
+                                }
+                                ParserEvent::Command(cmd) => {
+                                    if let Some(ref mut block) = pane.current_block {
+                                        block.command = cmd;
+                                    }
+                                }
+                                ParserEvent::Directory(dir) => {
+                                    if let Some(ref mut block) = pane.current_block {
+                                        block.directory = dir.clone();
+                                        pane.working_directory = dir;
+                                    }
+                                }
+                                ParserEvent::GitBranch(branch) => {
+                                    if let Some(ref mut block) = pane.current_block {
+                                        block.git_branch = Some(branch);
+                                    }
+                                }
+                                ParserEvent::CommandEnd(status) => {
+                                    if let Some(mut block) = pane.current_block.take() {
+                                        block.status = Some(status);
+                                        if let Some(start) = block.start_time {
+                                            block.duration = Some(start.elapsed());
+                                        }
+                                        block.output = pane.parser.screen_text();
+                                        pane.history.push(block);
+                                    }
+                                }
                             }
                         }
                     }
@@ -126,51 +265,75 @@ impl Application for Tant {
                 Command::none()
             }
             Message::KeyPress(c) => {
-                let rt = tokio::runtime::Handle::current();
-                let data = vec![c as u8];
-                rt.block_on(async {
-                    use tokio::io::AsyncWriteExt;
-                    self.pty.writer().write_all(&data).await.ok();
-                });
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        let rt = tokio::runtime::Handle::current();
+                        let data = vec![c as u8];
+                        rt.block_on(async {
+                            use tokio::io::AsyncWriteExt;
+                            pane.pty.writer().write_all(&data).await.ok();
+                        });
+                    }
+                }
                 Command::none()
             }
             Message::Resize(width, height) => {
                 let (cell_w, cell_h) = self.renderer.cell_size();
                 let cols = (width as f32 / cell_w) as u16;
                 let rows = (height as f32 / cell_h) as u16;
-                self.parser.resize(rows, cols);
-                self.pty.resize(rows, cols).ok();
+                for tab in &mut self.layout {
+                    for pane in &mut tab.panes {
+                        pane.parser.resize(rows, cols);
+                        pane.pty.resize(rows, cols).ok();
+                    }
+                }
                 Command::none()
             }
             Message::UpdateCommand(index, new_cmd) => {
-                if let Some(block) = self.history.get_mut(index) {
-                    block.command = new_cmd;
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        if let Some(block) = pane.history.get_mut(index) {
+                            block.command = new_cmd;
+                        }
+                    }
                 }
                 Command::none()
             }
             Message::RerunCommand(index) => {
-                if let Some(block) = self.history.get(index) {
-                    let cmd = format!("{}\n", block.command);
-                    let rt = tokio::runtime::Handle::current();
-                    rt.block_on(async {
-                        use tokio::io::AsyncWriteExt;
-                        self.pty.writer().write_all(cmd.as_bytes()).await.ok();
-                    });
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        if let Some(block) = pane.history.get(index) {
+                            let cmd = format!("{}\n", block.command);
+                            let rt = tokio::runtime::Handle::current();
+                            rt.block_on(async {
+                                use tokio::io::AsyncWriteExt;
+                                pane.pty.writer().write_all(cmd.as_bytes()).await.ok();
+                            });
+                        }
+                    }
                 }
                 Command::none()
             }
             Message::UpdateCurrent(cmd) => {
-                self.current_command = cmd;
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        pane.current_command = cmd;
+                    }
+                }
                 Command::none()
             }
             Message::RunCurrent => {
-                let cmd = format!("{}\n", self.current_command);
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async {
-                    use tokio::io::AsyncWriteExt;
-                    self.pty.writer().write_all(cmd.as_bytes()).await.ok();
-                });
-                self.current_command.clear();
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        let cmd = format!("{}\n", pane.current_command);
+                        let rt = tokio::runtime::Handle::current();
+                        rt.block_on(async {
+                            use tokio::io::AsyncWriteExt;
+                            pane.pty.writer().write_all(cmd.as_bytes()).await.ok();
+                        });
+                        pane.current_command.clear();
+                    }
+                }
                 Command::none()
             }
             Message::UpdateSearch(query) => {
@@ -178,25 +341,43 @@ impl Application for Tant {
                 Command::none()
             }
             Message::TogglePin(index) => {
-                if let Some(block) = self.history.get_mut(index) {
-                    block.pinned = !block.pinned;
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        if let Some(block) = pane.history.get_mut(index) {
+                            block.pinned = !block.pinned;
+                        }
+                    }
                 }
                 Command::none()
             }
-            Message::PtyData(_) | Message::None => Command::none(),
+            Message::SaveSession => {
+                self.save_session().ok();
+                Command::none()
+            }
+            Message::PtyData(_) | Message::ParserEvents(_) | Message::None => Command::none(),
         }
     }
 
     fn view(&self) -> Element<Message> {
-        self.renderer.view(&self.history, &self.current_block, &self.current_command, &self.search_query, self.parser.screen())
+        if let Some(tab) = self.layout.get(self.active_tab) {
+            if let Some(pane) = tab.panes.get(tab.active_pane) {
+                self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query)
+            } else {
+                let dummy_parser = TerminalParser::new(24, 80);
+                self.renderer.view(&[], &None, &String::new(), &self.search_query)
+            }
+        } else {
+            let dummy_parser = TerminalParser::new(24, 80);
+            self.renderer.view(&[], &None, &String::new(), &self.search_query)
+        }
     }
 
     fn subscription(&self) -> Subscription<Message> {
         let time_sub = time::every(std::time::Duration::from_millis(10)).map(|_| Message::Tick);
-        let resize_sub = iced::subscription::events_with(|event, _status| {
+        let resize_sub = iced::event::listen().map(|event| {
             match event {
-                iced::Event::Window(window::Event::Resized { width, height }) => Some(Message::Resize(width, height)),
-                _ => None,
+                iced::Event::Window(_, window::Event::Resized { width, height }) => Message::Resize(width, height),
+                _ => Message::None,
             }
         });
         Subscription::batch(vec![time_sub, resize_sub])

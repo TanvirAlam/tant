@@ -1,15 +1,11 @@
 // PTY + process management
 // Spawn the user's shell inside a pseudo-terminal
 
-#[cfg(unix)]
-use portable_pty::unix::{PtyMaster, PtyPair};
-#[cfg(windows)]
-use portable_pty::windows::{PtyMaster, PtyPair};
-use portable_pty::{CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, PtySystem};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub struct PtyManager {
-    master: PtyMaster,
+    master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send>,
     reader: Box<dyn AsyncRead + Send + Unpin>,
     writer: Box<dyn AsyncWrite + Send + Unpin>,
@@ -18,9 +14,9 @@ pub struct PtyManager {
 impl PtyManager {
     pub fn new(shell: &str) -> Result<Self, Box<dyn std::error::Error>> {
         #[cfg(unix)]
-        let pty_system = portable_pty::unix::PtySystem::default();
+        let pty_system = PtySystem::default();
         #[cfg(windows)]
-        let pty_system = portable_pty::windows::PtySystem::default();
+        let pty_system = PtySystem::default();
         let pair = pty_system.openpty(PtySize {
             rows: 24,
             cols: 80,

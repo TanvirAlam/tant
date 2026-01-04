@@ -1,6 +1,6 @@
 // Renderer + UI shell
 
-use iced::widget::{Column, Text, Collapsible, TextInput, Button, Row};
+use iced::widget::{Column, Text, TextInput, Button, Row};
 use iced::{Element, Length};
 
 use crate::{Message, Block};
@@ -16,7 +16,7 @@ impl TerminalRenderer {
         (8.0, 16.0)
     }
 
-    pub fn view(&self, history: &Vec<Block>, current: &Option<Block>, current_command: &str, search_query: &str, _screen: &vt100::Screen) -> Element<Message> {
+    pub fn view<'a>(&self, history: &'a [Block], current: &Option<Block>, current_command: &str, search_query: &str) -> Element<'a, Message> {
         let mut column = Column::new().spacing(10).padding(10);
 
         // Search input
@@ -41,10 +41,7 @@ impl TerminalRenderer {
                 .push(pin_button);
             let status = Text::new(format!("Status: {:?}, Dir: {}, Branch: {:?}", block.status, block.directory, block.git_branch));
             let duration = Text::new(format!("Duration: {:?}", block.duration));
-            let output = Collapsible::new(
-                Text::new("Output"),
-                Text::new(&block.output),
-            );
+            let output = Text::new(&block.output);
             column = column.push(command_row).push(status).push(duration).push(output);
         }
 
