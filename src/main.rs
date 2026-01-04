@@ -361,6 +361,11 @@ impl Application for Tant {
                         let events = pane.parser.take_events();
                         for event in events {
                             match event {
+                                ParserEvent::PromptShown => {
+                                    // Prompt is being shown - this happens before user input
+                                    // We can use this to prepare for the next command
+                                    eprintln!("[Block Detection] Prompt shown");
+                                }
                                 ParserEvent::CommandStart => {
                                     if let Some(mut block) = pane.current_block.take() {
                                         if let Some(start) = block.start_time {
@@ -379,6 +384,7 @@ impl Application for Tant {
                                         host: "localhost".to_string(), // TODO: get actual host
                                         pinned: false,
                                     });
+                                    eprintln!("[Block Detection] Command started - new block created");
                                 }
                                 ParserEvent::Command(cmd) => {
                                     if let Some(ref mut block) = pane.current_block {
@@ -404,6 +410,7 @@ impl Application for Tant {
                                         }
                                         block.output = pane.parser.screen_text();
                                         pane.history.push(block);
+                                        eprintln!("[Block Detection] Command ended with status {} - block saved", status);
                                     }
                                 }
                             }
