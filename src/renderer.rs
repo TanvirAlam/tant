@@ -1,7 +1,7 @@
 // Renderer + UI shell
 
 use iced::widget::{Canvas, Column, Row, Button, Text, Scrollable};
-use iced::{Element, Length, Color, Point, Size, Rectangle, Theme, Pixels};
+use iced::{Element, Length, Color, Point, Size, Rectangle, Theme, Pixels, Font};
 use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
 use vt100;
@@ -11,15 +11,36 @@ use crate::{Message, AiSettings, Block};
 pub struct TerminalRenderer;
 
 fn color_to_iced(color: vt100::Color) -> Color {
-    // For simplicity, assume Rgb or default
-    // Since the variants are not matching, let's use a simple approach
-    // Perhaps the Color has rgb() method
-    // But since not, let's assume it's Rgb
-    if let vt100::Color::Rgb(r, g, b) = color {
-        Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
-    } else {
-        Color::WHITE // default
+    match color {
+        vt100::Color::Rgb(r, g, b) => Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
+        vt100::Color::Idx(idx) => {
+            // Standard ANSI colors
+            match idx {
+                0 => Color::from_rgb(0.0, 0.0, 0.0),       // Black
+                1 => Color::from_rgb(0.8, 0.0, 0.0),       // Red
+                2 => Color::from_rgb(0.0, 0.8, 0.0),       // Green
+                3 => Color::from_rgb(0.8, 0.8, 0.0),       // Yellow
+                4 => Color::from_rgb(0.0, 0.0, 0.8),       // Blue
+                5 => Color::from_rgb(0.8, 0.0, 0.8),       // Magenta
+                6 => Color::from_rgb(0.0, 0.8, 0.8),       // Cyan
+                7 => Color::from_rgb(0.9, 0.9, 0.9),       // White
+                8 => Color::from_rgb(0.5, 0.5, 0.5),       // Bright Black
+                9 => Color::from_rgb(1.0, 0.0, 0.0),       // Bright Red
+                10 => Color::from_rgb(0.0, 1.0, 0.0),      // Bright Green
+                11 => Color::from_rgb(1.0, 1.0, 0.0),      // Bright Yellow
+                12 => Color::from_rgb(0.0, 0.0, 1.0),      // Bright Blue
+                13 => Color::from_rgb(1.0, 0.0, 1.0),      // Bright Magenta
+                14 => Color::from_rgb(0.0, 1.0, 1.0),      // Bright Cyan
+                15 => Color::from_rgb(1.0, 1.0, 1.0),      // Bright White
+                _ => Color::from_rgb(0.9, 0.9, 0.9),       // Default to white
+            }
+        }
+        vt100::Color::Default => Color::from_rgb(0.9, 0.9, 0.9), // Default foreground
     }
+}
+
+fn default_bg_color() -> Color {
+    Color::from_rgb(0.0, 0.0, 0.0) // Black background
 }
 
 impl TerminalRenderer {
@@ -81,6 +102,9 @@ impl Program<Message> for TerminalCanvas {
     fn draw(&self, _state: &Self::State, renderer: &iced::Renderer, _theme: &Theme, bounds: Rectangle, _cursor: Cursor) -> Vec<canvas::Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
 
+        // Fill with default background
+        frame.fill_rectangle(Point::ORIGIN, bounds.size(), default_bg_color());
+
         let size = self.screen.size();
         let rows = size.1 as usize;
         let cols = size.0 as usize;
@@ -101,13 +125,14 @@ impl Program<Message> for TerminalCanvas {
                     frame.fill_rectangle(Point::new(x, y), Size::new(display_width, self.cell_height), bg);
 
                     // Draw text only if content is not empty
-                    if !content.is_empty() {
+                    if !content.is_empty() && content != " " {
                         let fg = color_to_iced(cell.fgcolor());
                         let text = canvas::Text {
                             content: content.into(),
-                            position: Point::new(x, y + self.cell_height),
+                            position: Point::new(x, y),
                             size: Pixels(self.cell_height),
                             color: fg,
+                            font: Font::MONOSPACE,
                             ..canvas::Text::default()
                         };
                         frame.fill_text(text);

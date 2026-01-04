@@ -15,70 +15,21 @@ pub enum ParserEvent {
 pub struct TerminalParser {
     parser: Parser,
     events: Vec<ParserEvent>,
+    scroll_offset: usize,
+    dirty: bool,
 }
 
 impl TerminalParser {
     pub fn new(rows: u16, cols: u16) -> Self {
         let parser = Parser::new(rows, cols, 1000); // Large scrollback
-        TerminalParser { parser, events: vec![] }
+        TerminalParser { parser, events: vec![], scroll_offset: 0, dirty: true }
     }
 
     pub fn process(&mut self, data: &[u8]) {
-        // Scan for OSC 1337 sequences
-        let data_str = String::from_utf8_lossy(data);
-        let mut i = 0;
-        while i < data_str.len() {
-            if data_str[i..].starts_with("\x1b]1337;") {
-                let start = i + 7; // after \e]1337;
-                if let Some(semi) = data_str[start..].find(';') {
-                    let cmd = &data_str[start..start+semi];
-                    if cmd == "CommandStart" {
-                        self.events.push(ParserEvent::CommandStart);
-                    } else if cmd == "Command" {
-                        let cmd_start = start + semi + 1;
-                        if let Some(end) = data_str[cmd_start..].find('\x1b') {
-                            let command = data_str[cmd_start..cmd_start+end].to_string();
-                            self.events.push(ParserEvent::Command(command));
-                            i += cmd_start + end;
-                            continue;
-                        }
-                    } else if cmd == "Directory" {
-                        let dir_start = start + semi + 1;
-                        if let Some(end) = data_str[dir_start..].find('\x1b') {
-                            let directory = data_str[dir_start..dir_start+end].to_string();
-                            self.events.push(ParserEvent::Directory(directory));
-                            i += dir_start + end;
-                            continue;
-                        }
-                    } else if cmd == "GitBranch" {
-                        let branch_start = start + semi + 1;
-                        if let Some(end) = data_str[branch_start..].find('\x1b') {
-                            let branch = data_str[branch_start..branch_start+end].to_string();
-                            self.events.push(ParserEvent::GitBranch(branch));
-                            i += branch_start + end;
-                            continue;
-                        }
-                    } else if cmd.starts_with("CommandEnd;") {
-                        if let Some(status_str) = cmd.strip_prefix("CommandEnd;") {
-                            if let Ok(status) = status_str.parse::<i32>() {
-                                self.events.push(ParserEvent::CommandEnd(status));
-                            }
-                        }
-                    }
-                    // Skip to end of OSC
-                    if let Some(end) = data_str[start..].find('\x1b') {
-                        i += start + end;
-                    } else {
-                        break;
-                    }
-                } else {
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-        }
+        // Just process the data directly with vt100 for now
+        // OSC 1337 sequence parsing can be added later if needed
         self.parser.process(data);
+        self.dirty = true;
     }
 
     pub fn screen(&self) -> &vt100::Screen {
@@ -87,6 +38,7 @@ impl TerminalParser {
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.set_size(rows, cols);
+        self.dirty = true;
     }
 
     pub fn take_events(&mut self) -> Vec<ParserEvent> {
@@ -104,5 +56,18 @@ impl TerminalParser {
             text.push('\n');
         }
         text
+    }
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        self.scroll_offset = offset;
+        self.dirty = true;
+    }
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
     }
 }

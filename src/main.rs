@@ -1,4 +1,5 @@
 use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window};
+use iced::keyboard::{self, Key, Modifiers};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -89,7 +90,8 @@ impl Pane {
 #[derive(Debug, Clone)]
 pub enum Message {
     Tick,
-    KeyPress(char),
+    KeyPress(Key, Modifiers),
+    TextInput(String),
     PtyData(Vec<u8>),
     Resize(u32, u32),
     ParserEvents(Vec<ParserEvent>),
@@ -107,6 +109,7 @@ pub enum Message {
     AiResponse(String),
     ToggleAiEnabled,
     UpdateAiSettings(AiSettings),
+    Paste(String),
     None,
 }
 
@@ -120,6 +123,61 @@ struct Tant {
 }
 
 impl Tant {
+    fn key_to_bytes(key: &Key, modifiers: &Modifiers) -> Vec<u8> {
+        match key {
+            Key::Named(named_key) => {
+                use iced::keyboard::key::Named;
+                match named_key {
+                    Named::Enter => vec![b'\r'],
+                    Named::Backspace => vec![0x7f],
+                    Named::Tab => vec![b'\t'],
+                    Named::Escape => vec![0x1b],
+                    Named::ArrowUp => b"\x1b[A".to_vec(),
+                    Named::ArrowDown => b"\x1b[B".to_vec(),
+                    Named::ArrowRight => b"\x1b[C".to_vec(),
+                    Named::ArrowLeft => b"\x1b[D".to_vec(),
+                    Named::Home => b"\x1b[H".to_vec(),
+                    Named::End => b"\x1b[F".to_vec(),
+                    Named::PageUp => b"\x1b[5~".to_vec(),
+                    Named::PageDown => b"\x1b[6~".to_vec(),
+                    Named::Delete => b"\x1b[3~".to_vec(),
+                    Named::Insert => b"\x1b[2~".to_vec(),
+                    _ => vec![],
+                }
+            }
+            Key::Character(c) => {
+                // Only handle Ctrl combinations here
+                // Regular characters will be handled by event processing directly as text
+                if modifiers.control() {
+                    let ch = c.chars().next().unwrap_or('\0');
+                    if ch.is_ascii_alphabetic() {
+                        let upper = ch.to_ascii_uppercase();
+                        // Ctrl+A = 0x01, Ctrl+B = 0x02, etc.
+                        let code = (upper as u8) - b'A' + 1;
+                        return vec![code];
+                    } else if ch == ' ' {
+                        return vec![0x00]; // Ctrl+Space = NUL
+                    } else if ch == '@' {
+                        return vec![0x00]; // Ctrl+@ = NUL
+                    } else if ch == '[' {
+                        return vec![0x1b]; // Ctrl+[ = ESC
+                    } else if ch == '\\' {
+                        return vec![0x1c]; // Ctrl+\\
+                    } else if ch == ']' {
+                        return vec![0x1d]; // Ctrl+]
+                    } else if ch == '^' {
+                        return vec![0x1e]; // Ctrl+^
+                    } else if ch == '_' {
+                        return vec![0x1f]; // Ctrl+_
+                    }
+                }
+                // Don't send regular characters here - only special keys and modifiers
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
     fn save_session(&self) -> Result<(), Box<dyn std::error::Error>> {
         let serializable_tabs: Vec<SerializableTab> = self.layout.iter().map(|tab| {
             SerializableTab {
@@ -186,13 +244,14 @@ impl Application for Tant {
     type Flags = ();
 
     fn new(_flags: ()) -> (Self, Command<Message>) {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let (layout, active_tab) = if let Ok(saved_layout) = Self::load_session() {
             // Restore from saved session
             let mut tabs = vec![];
             for saved_tab in saved_layout.tabs {
                 let mut panes = vec![];
                 for saved_pane in saved_tab.panes {
-                    let pane = Pane::new("bash", Some(saved_pane.working_directory.clone())).unwrap();
+                    let pane = Pane::new(&shell, Some(saved_pane.working_directory.clone())).unwrap();
                     // Restore history and current_command
                     let mut pane = pane;
                     pane.history = saved_pane.history;
@@ -206,7 +265,7 @@ impl Application for Tant {
             (tabs, saved_layout.active_tab)
         } else {
             // Default
-            let pane = Pane::new("bash", None).unwrap();
+            let pane = Pane::new(&shell, None).unwrap();
             let tab = Tab { panes: vec![pane], active_pane: 0 };
             (vec![tab], 0)
         };
@@ -229,12 +288,16 @@ impl Application for Tant {
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::Tick => {
-                let _rt = tokio::runtime::Handle::current();
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
-                        // Dummy: no PTY reading
-                        // Simulate some input for demo
-                        // pane.parser.process(b"hello\n");
+                        let mut buf = [0u8; 1024];
+                        if let Ok(mut pty) = pane.pty.try_lock() {
+                            if let Ok(n) = pty.reader().read(&mut buf) {
+                                if n > 0 {
+                                    pane.parser.process(&buf[..n]);
+                                }
+                            }
+                        }
                         // Handle parser events
                         let events = pane.parser.take_events();
                         for event in events {
@@ -290,13 +353,41 @@ impl Application for Tant {
                 }
                 Command::none()
             }
-            Message::KeyPress(c) => {
+            Message::KeyPress(key, modifiers) => {
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
-                        // Dummy: no PTY writing
-                        // Simulate processing input
-                        let data = vec![c as u8];
-                        pane.parser.process(&data);
+                        if let Ok(mut pty) = pane.pty.try_lock() {
+                            let bytes = Self::key_to_bytes(&key, &modifiers);
+                            if !bytes.is_empty() {
+                                pty.writer().write_all(&bytes).ok();
+                                pty.writer().flush().ok();
+                            }
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::TextInput(text) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        if let Ok(mut pty) = pane.pty.try_lock() {
+                            pty.writer().write_all(text.as_bytes()).ok();
+                            pty.writer().flush().ok();
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::Paste(text) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        if let Ok(mut pty) = pane.pty.try_lock() {
+                            // Bracketed paste mode
+                            pty.writer().write_all(b"\x1b[200~").ok();
+                            pty.writer().write_all(text.as_bytes()).ok();
+                            pty.writer().write_all(b"\x1b[201~").ok();
+                            pty.writer().flush().ok();
+                        }
                     }
                 }
                 Command::none()
@@ -308,7 +399,9 @@ impl Application for Tant {
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
                         pane.parser.resize(rows, cols);
-                        // pane.pty.resize(rows, cols).ok();
+                        if let Ok(mut pty) = pane.pty.try_lock() {
+                            pty.resize(rows, cols).ok();
+                        }
                     }
                 }
                 Command::none()
@@ -430,13 +523,25 @@ impl Application for Tant {
 
     fn subscription(&self) -> Subscription<Message> {
         let time_sub = time::every(std::time::Duration::from_millis(10)).map(|_| Message::Tick);
-        let resize_sub = iced::event::listen().map(|event| {
+        let event_sub = iced::event::listen().map(|event| {
             match event {
-                iced::Event::Window(_, window::Event::Resized { width, height }) => Message::Resize(width, height),
+                iced::Event::Window(_, window::Event::Resized { width, height }) => {
+                    Message::Resize(width, height)
+                }
+                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
+                    // If there's text and no modifiers (except shift), send as text
+                    if let Some(txt) = text {
+                        if !modifiers.control() && !modifiers.alt() && !modifiers.logo() {
+                            return Message::TextInput(txt.to_string());
+                        }
+                    }
+                    // Otherwise handle as special key
+                    Message::KeyPress(key, modifiers)
+                }
                 _ => Message::None,
             }
         });
-        Subscription::batch(vec![time_sub, resize_sub])
+        Subscription::batch(vec![time_sub, event_sub])
     }
 }
 
