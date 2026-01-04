@@ -16,10 +16,8 @@ pub enum ParserEvent {
 // OSC 133 sequence markers (Warp/FinalTerm style)
 // These are emitted by shell integration scripts
 const OSC_PROMPT_START: &str = "\x1b]133;A";
-const OSC_PROMPT_END: &str = "\x1b]133;B";
 const OSC_COMMAND_START: &str = "\x1b]133;C";
 const OSC_COMMAND_END_PREFIX: &str = "\x1b]133;D";
-const OSC_COMMAND_FINISHED_PREFIX: &str = "\x1b]133;E";
 
 pub struct TerminalParser {
     parser: Parser,
@@ -27,19 +25,19 @@ pub struct TerminalParser {
     dirty: bool,
     buffer: Vec<u8>, // Buffer for detecting OSC sequences
     in_command: bool,
-    last_command: String,
+    alt_screen_active: bool,
 }
 
 impl TerminalParser {
     pub fn new(rows: u16, cols: u16) -> Self {
         let parser = Parser::new(rows, cols, 1000); // Large scrollback
-        TerminalParser { 
-            parser, 
-            events: vec![], 
+        TerminalParser {
+            parser,
+            events: vec![],
             dirty: true,
             buffer: Vec::new(),
             in_command: false,
-            last_command: String::new(),
+            alt_screen_active: false,
         }
     }
 
@@ -57,6 +55,16 @@ impl TerminalParser {
     
     fn detect_shell_integration_markers(&mut self) {
         let buffer_str = String::from_utf8_lossy(&self.buffer);
+        
+        // Check for alt screen sequences
+        if buffer_str.contains("\x1b[?1049h") {
+            self.alt_screen_active = true;
+            eprintln!("[Alt Screen] Entered alt screen mode");
+        }
+        if buffer_str.contains("\x1b[?1049l") {
+            self.alt_screen_active = false;
+            eprintln!("[Alt Screen] Exited alt screen mode");
+        }
         
         // Check for OSC 133 sequences
         if buffer_str.contains(OSC_PROMPT_START) {
@@ -125,5 +133,9 @@ impl TerminalParser {
     }
     pub fn mark_clean(&mut self) {
         self.dirty = false;
+    }
+    
+    pub fn is_alt_screen_active(&self) -> bool {
+        self.alt_screen_active
     }
 }

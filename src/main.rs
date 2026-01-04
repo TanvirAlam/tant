@@ -1,6 +1,6 @@
-use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse, clipboard, Point, Length};
+use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse, clipboard, Point, Length, Color};
 use iced::keyboard::{self, Key, Modifiers};
-use iced::widget::{Row, Column, Button, TextInput, container};
+use iced::widget::{Row, Column, container};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -29,6 +29,8 @@ pub struct Block {
     pub output: String,
     pub git_branch: Option<String>,
     pub host: String,
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 pub struct Pane {
@@ -138,6 +140,8 @@ pub enum Message {
     ParserEvents(Vec<ParserEvent>),
     UpdateCommand(usize, String),
     RerunCommand(usize),
+    CopyCommand(usize),
+    ToggleCollapsed(usize),
     UpdateCurrent(String),
     RunCurrent,
     UpdateSearch(String),
@@ -276,13 +280,6 @@ impl Tant {
         data
     }
 
-    fn pos_to_cell(&self, pos: Point) -> (usize, usize) {
-        let cell_w = self.renderer.cell_size().0;
-        let cell_h = self.renderer.cell_size().1;
-        let col = (pos.x / cell_w) as usize;
-        let row = (pos.y / cell_h) as usize;
-        (row, col)
-    }
 
     fn call_ai(&self, prompt: &str, action: &str) -> String {
         // Mock AI response
@@ -375,8 +372,12 @@ impl Application for Tant {
                                             block.ended_at = Some(Utc::now());
                                             block.duration_ms = Some((Utc::now() - start).num_milliseconds() as u64);
                                         }
+                                        // Capture output at command end
+                                        block.output = pane.parser.screen_text();
                                         pane.history.push(block);
                                     }
+                                    // Clear screen text to start fresh for new command
+                                    // Note: We can't actually clear the vt100 screen, but we'll capture the delta
                                     pane.current_block = Some(Block {
                                         command: String::new(),
                                         started_at: Some(Utc::now()),
@@ -390,6 +391,7 @@ impl Application for Tant {
                                         output: String::new(),
                                         git_branch: None,
                                         host: "localhost".to_string(), // TODO: get actual host
+                                        collapsed: false,
                                     });
                                     eprintln!("[Block Detection] Command started - new block created");
                                 }
@@ -416,6 +418,7 @@ impl Application for Tant {
                                             block.ended_at = Some(Utc::now());
                                             block.duration_ms = Some((Utc::now() - start).num_milliseconds() as u64);
                                         }
+                                        // Capture output - this gets the visible screen at command end
                                         block.output = pane.parser.screen_text();
                                         pane.history.push(block);
                                         eprintln!("[Block Detection] Command ended with status {} - block saved", status);
@@ -509,9 +512,31 @@ impl Application for Tant {
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         if let Some(block) = pane.history.get(index) {
-                            let cmd = format!("{}\n", block.command);
-                            // Dummy: process as input
-                            pane.parser.process(cmd.as_bytes());
+                            if let Ok(mut pty) = pane.pty.try_lock() {
+                                let cmd = format!("{}\r", block.command);
+                                pty.writer().write_all(cmd.as_bytes()).ok();
+                                pty.writer().flush().ok();
+                            }
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::CopyCommand(index) => {
+                if let Some(tab) = self.layout.get(self.active_tab) {
+                    if let Some(pane) = tab.panes.get(tab.active_pane) {
+                        if let Some(block) = pane.history.get(index) {
+                            return clipboard::write(block.command.clone());
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::ToggleCollapsed(index) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        if let Some(block) = pane.history.get_mut(index) {
+                            block.collapsed = !block.collapsed;
                         }
                     }
                 }
@@ -742,14 +767,23 @@ impl Application for Tant {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, 0, None, None)
+            self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None)
         };
 
         layout_view
     }
 
     fn theme(&self) -> Theme {
-        Theme::Dark
+        Theme::custom(
+            "Tant Dark".to_string(),
+            iced::theme::Palette {
+                background: Color::from_rgb(0.11, 0.11, 0.11),
+                text: Color::from_rgb(0.9, 0.9, 0.9),
+                primary: Color::from_rgb(0.4, 0.7, 0.9),
+                success: Color::from_rgb(0.2, 0.8, 0.2),
+                danger: Color::from_rgb(0.9, 0.3, 0.3),
+            },
+        )
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -787,20 +821,28 @@ impl Application for Tant {
                         return Message::KeyPress(key.clone(), modifiers);
                     }
                     
-                    // Check if it's a named key (arrows, enter, etc.)
+                    // Check if it's a named key (arrows, enter, etc.) but NOT Space
                     if matches!(key, iced::keyboard::Key::Named(_)) {
                         eprintln!("Sending as KeyPress (named key)");
                         return Message::KeyPress(key.clone(), modifiers);
                     }
                     
-                    // For regular characters, prefer text field if available
+                    // For regular characters (including space), prefer text field if available
                     if let Some(txt) = text {
-                        eprintln!("Sending as TextInput: {:?}", txt);
-                        return Message::TextInput(txt.to_string());
+                        if !txt.is_empty() {
+                            eprintln!("Sending as TextInput: {:?}", txt);
+                            return Message::TextInput(txt.to_string());
+                        }
+                    }
+                    
+                    // Special handling for space if text is empty
+                    if matches!(&key, iced::keyboard::Key::Character(c) if c == " ") {
+                        eprintln!("Sending space character");
+                        return Message::TextInput(" ".to_string());
                     }
                     
                     // Fallback to key press
-                    eprintln!("Sending as KeyPress (fallback)");
+                    eprintln!("Sending as KeyPress (fallback) for key: {:?}", key);
                     Message::KeyPress(key.clone(), modifiers)
                 }
                 _ => Message::None,
@@ -815,10 +857,10 @@ impl Tant {
         match node {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
-                    self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end)
+                    self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end)
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
-                    self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, 0, None, None)
+                    self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None)
                 }
             }
             LayoutNode::Split { axis, ratio, left, right } => {
