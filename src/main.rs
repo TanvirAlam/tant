@@ -56,6 +56,16 @@ pub struct Layout {
     pub active_tab: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiSettings {
+    pub enabled: bool,
+    pub send_current_command: bool,
+    pub send_last_n_blocks: usize,
+    pub send_repo_context: bool,
+    pub provider: String, // e.g., "openai", "anthropic"
+    pub api_key: Option<String>,
+}
+
 impl Pane {
     pub fn new(_shell: &str, working_directory: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
         let wd = working_directory.unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
@@ -88,6 +98,13 @@ pub enum Message {
     UpdateSearch(String),
     TogglePin(usize),
     SaveSession,
+    AiExplainError,
+    AiSuggestFix,
+    AiGenerateCommand,
+    AiSummarizeOutput,
+    AiResponse(String),
+    ToggleAiEnabled,
+    UpdateAiSettings(AiSettings),
     None,
 }
 
@@ -96,6 +113,8 @@ struct Tant {
     active_tab: usize,
     renderer: TerminalRenderer,
     search_query: String,
+    ai_settings: AiSettings,
+    ai_response: Option<String>,
 }
 
 impl Tant {
@@ -125,6 +144,36 @@ impl Tant {
         let json = std::fs::read_to_string("session.json")?;
         let layout: Layout = serde_json::from_str(&json)?;
         Ok(layout)
+    }
+
+    fn collect_ai_data(&self, include_current: bool, last_n: usize) -> String {
+        let mut data = String::new();
+        if let Some(tab) = self.layout.get(self.active_tab) {
+            if let Some(pane) = tab.panes.get(tab.active_pane) {
+                if include_current && self.ai_settings.send_current_command {
+                    data.push_str(&format!("Current command: {}\n", pane.current_command));
+                }
+                if self.ai_settings.send_last_n_blocks > 0 {
+                    let start = pane.history.len().saturating_sub(last_n);
+                    for block in &pane.history[start..] {
+                        data.push_str(&format!("Command: {}\nOutput: {}\nStatus: {:?}\n\n", block.command, block.output, block.status));
+                    }
+                }
+                // Repo context not implemented yet
+            }
+        }
+        data
+    }
+
+    fn call_ai(&self, prompt: &str, action: &str) -> String {
+        // Mock AI response
+        match action {
+            "explain_error" => format!("AI Explanation: Based on the output, this error seems to be related to...\n\n{}", prompt),
+            "suggest_fix" => format!("AI Suggestion: Try running the following command to fix the issue:\n\n```bash\nsome_fix_command\n```\n\n{}", prompt),
+            "generate_command" => format!("AI Generated Command: Based on your request, try:\n\n```bash\ngenerated_command\n```\n\n{}", prompt),
+            "summarize_output" => format!("AI Summary: The output shows...\n\n{}", prompt),
+            _ => format!("AI Response: {}\n\n{}", action, prompt),
+        }
     }
 }
 
@@ -160,7 +209,15 @@ impl Application for Tant {
             (vec![tab], 0)
         };
         let renderer = TerminalRenderer::new();
-        (Tant { layout, active_tab, renderer, search_query: String::new() }, Command::none())
+        let ai_settings = AiSettings {
+            enabled: false,
+            send_current_command: false,
+            send_last_n_blocks: 5,
+            send_repo_context: false,
+            provider: "mock".to_string(),
+            api_key: None,
+        };
+        (Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None }, Command::none())
     }
 
     fn title(&self) -> String {
@@ -313,6 +370,44 @@ impl Application for Tant {
                 self.save_session().ok();
                 Command::none()
             }
+            Message::AiExplainError => {
+                if self.ai_settings.enabled {
+                    let data = self.collect_ai_data(true, self.ai_settings.send_last_n_blocks);
+                    let response = self.call_ai(&data, "explain_error");
+                    self.ai_response = Some(response);
+                }
+                Command::none()
+            }
+            Message::AiSuggestFix => {
+                if self.ai_settings.enabled {
+                    let data = self.collect_ai_data(true, self.ai_settings.send_last_n_blocks);
+                    let response = self.call_ai(&data, "suggest_fix");
+                    self.ai_response = Some(response);
+                }
+                Command::none()
+            }
+            Message::AiGenerateCommand => {
+                if self.ai_settings.enabled {
+                    let data = self.collect_ai_data(false, 0);
+                    let response = self.call_ai(&data, "generate_command");
+                    self.ai_response = Some(response);
+                }
+                Command::none()
+            }
+            Message::AiSummarizeOutput => {
+                if self.ai_settings.enabled {
+                    let data = self.collect_ai_data(false, self.ai_settings.send_last_n_blocks);
+                    let response = self.call_ai(&data, "summarize_output");
+                    self.ai_response = Some(response);
+                }
+                Command::none()
+            }
+            Message::AiResponse(_) => Command::none(),
+            Message::ToggleAiEnabled => {
+                self.ai_settings.enabled = !self.ai_settings.enabled;
+                Command::none()
+            }
+            Message::UpdateAiSettings(_) => Command::none(),
             Message::PtyData(_) | Message::ParserEvents(_) | Message::None => Command::none(),
         }
     }
@@ -320,14 +415,14 @@ impl Application for Tant {
     fn view(&self) -> Element<Message> {
         if let Some(tab) = self.layout.get(self.active_tab) {
             if let Some(pane) = tab.panes.get(tab.active_pane) {
-                self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen())
+                self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), &self.ai_settings, &self.ai_response)
             } else {
                 let dummy_parser = TerminalParser::new(24, 80);
-                self.renderer.view(&[], &None, &String::new(), &self.search_query, dummy_parser.screen())
+                self.renderer.view(&[], &None, &String::new(), &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response)
             }
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, &String::new(), &self.search_query, dummy_parser.screen())
+            self.renderer.view(&[], &None, &String::new(), &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response)
         }
     }
 

@@ -1,12 +1,11 @@
 // Renderer + UI shell
 
-use iced::widget::Canvas;
+use iced::widget::{Canvas, Column, Row, Button, Text, Scrollable};
 use iced::{Element, Length, Color, Point, Size, Rectangle, Theme, Pixels};
-use iced::widget::canvas::{self, Program, Frame, Text};
+use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
 use vt100;
-
-use crate::{Message, Block};
+use crate::{Message, AiSettings, Block};
 
 pub struct TerminalRenderer;
 
@@ -31,7 +30,7 @@ impl TerminalRenderer {
         (8.0, 16.0)
     }
 
-    pub fn view<'a>(&self, _history: &'a [Block], _current: &Option<Block>, _current_command: &str, _search_query: &str, screen: &vt100::Screen) -> Element<'a, Message> {
+    pub fn view<'a>(&self, _history: &'a [Block], _current: &Option<Block>, _current_command: &str, _search_query: &str, screen: &vt100::Screen, ai_settings: &'a AiSettings, ai_response: &'a Option<String>) -> Element<'a, Message> {
         let canvas = Canvas::new(TerminalCanvas {
             screen: screen.clone(),
             cell_width: 8.0,
@@ -40,7 +39,32 @@ impl TerminalRenderer {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        canvas.into()
+        let mut column = Column::new().spacing(10);
+
+        // AI toggle
+        let ai_toggle = Button::new(if ai_settings.enabled { "Disable AI" } else { "Enable AI" }).on_press(Message::ToggleAiEnabled);
+        column = column.push(ai_toggle);
+
+        // AI buttons
+        if ai_settings.enabled {
+            let ai_row = Row::new().spacing(10)
+                .push(Button::new("Explain Error").on_press(Message::AiExplainError))
+                .push(Button::new("Suggest Fix").on_press(Message::AiSuggestFix))
+                .push(Button::new("Generate Command").on_press(Message::AiGenerateCommand))
+                .push(Button::new("Summarize Output").on_press(Message::AiSummarizeOutput));
+            column = column.push(ai_row);
+        }
+
+        column = column.push(canvas);
+
+        // AI response
+        if let Some(response) = ai_response {
+            let response_text = Text::new(response);
+            let scrollable = Scrollable::new(response_text);
+            column = column.push(scrollable);
+        }
+
+        column.into()
     }
 }
 
@@ -72,13 +96,14 @@ impl Program<Message> for TerminalCanvas {
 
                     // Draw text
                     let fg = color_to_iced(cell.fgcolor());
-                    frame.fill_text(Text {
-                        content: cell.contents(),
+                    let text = canvas::Text {
+                        content: cell.contents().into(),
                         position: Point::new(x, y + self.cell_height),
                         size: Pixels(self.cell_height),
                         color: fg,
-                        ..Text::default()
-                    });
+                        ..canvas::Text::default()
+                    };
+                    frame.fill_text(text);
                 }
             }
         }
