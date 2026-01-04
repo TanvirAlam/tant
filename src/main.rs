@@ -1,5 +1,6 @@
-use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse, clipboard, Point};
+use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse, clipboard, Point, Length};
 use iced::keyboard::{self, Key, Modifiers};
+use iced::widget::{Row, Column, Button, TextInput, container};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -35,6 +36,12 @@ pub struct Pane {
     pub current_command: String,
     pub working_directory: String,
     pub data_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    pub scroll_offset: usize,
+    pub follow_mode: bool,
+    pub selection_start: Option<(usize, usize)>,
+    pub selection_end: Option<(usize, usize)>,
+    pub mouse_button_down: bool,
+    pub last_cursor_pos: Point,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,12 +52,14 @@ pub struct SerializablePane {
 }
 
 pub struct Tab {
+    pub root: LayoutNode,
     pub panes: Vec<Pane>,
     pub active_pane: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SerializableTab {
+    pub root: LayoutNode,
     pub panes: Vec<SerializablePane>,
     pub active_pane: usize,
 }
@@ -71,6 +80,25 @@ pub struct AiSettings {
     pub api_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LayoutNode {
+    Split {
+        axis: Axis,
+        ratio: f32,
+        left: Box<LayoutNode>,
+        right: Box<LayoutNode>,
+    },
+    Leaf {
+        pane_id: usize,
+    },
+}
+
 impl Pane {
     pub fn new(shell: &str, working_directory: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
         let wd = working_directory.unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
@@ -86,6 +114,12 @@ impl Pane {
             current_command: String::new(),
             working_directory: wd,
             data_receiver: receiver,
+            scroll_offset: 0,
+            follow_mode: true,
+            selection_start: None,
+            selection_end: None,
+            mouse_button_down: false,
+            last_cursor_pos: Point { x: 0.0, y: 0.0 },
         })
     }
 }
@@ -133,12 +167,6 @@ struct Tant {
     search_query: String,
     ai_settings: AiSettings,
     ai_response: Option<String>,
-    scroll_offset: usize,
-    follow_mode: bool,
-    selection_start: Option<(usize, usize)>,
-    selection_end: Option<(usize, usize)>,
-    mouse_button_down: bool,
-    last_cursor_pos: Point,
 }
 
 impl Tant {
@@ -200,6 +228,7 @@ impl Tant {
     fn save_session(&self) -> Result<(), Box<dyn std::error::Error>> {
         let serializable_tabs: Vec<SerializableTab> = self.layout.iter().map(|tab| {
             SerializableTab {
+                root: tab.root.clone(),
                 panes: tab.panes.iter().map(|pane| {
                     SerializablePane {
                         history: pane.history.clone(),
@@ -286,14 +315,15 @@ impl Application for Tant {
                     pane.working_directory = saved_pane.working_directory;
                     panes.push(pane);
                 }
-                let tab = Tab { panes, active_pane: saved_tab.active_pane };
+                let tab = Tab { root: saved_tab.root, panes, active_pane: saved_tab.active_pane };
                 tabs.push(tab);
             }
             (tabs, saved_layout.active_tab)
         } else {
-            // Default
+            // Default: single pane
             let pane = Pane::new(&shell, None).unwrap();
-            let tab = Tab { panes: vec![pane], active_pane: 0 };
+            let root = LayoutNode::Leaf { pane_id: 0 };
+            let tab = Tab { root, panes: vec![pane], active_pane: 0 };
             (vec![tab], 0)
         };
         let renderer = TerminalRenderer::new();
@@ -306,7 +336,7 @@ impl Application for Tant {
             api_key: None,
         };
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None, scroll_offset: 0, follow_mode: true, selection_start: None, selection_end: None, mouse_button_down: false, last_cursor_pos: Point { x: 0.0, y: 0.0 } },
+            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -380,9 +410,15 @@ impl Application for Tant {
                         }
                     }
                 }
-                // If follow mode and new data, scroll to bottom
-                if has_new_data && self.follow_mode {
-                    self.scroll_offset = 0;
+                // If follow mode and new data, scroll to bottom per pane
+                if has_new_data {
+                    for tab in &mut self.layout {
+                        for pane in &mut tab.panes {
+                            if pane.follow_mode {
+                                pane.scroll_offset = 0;
+                            }
+                        }
+                    }
                 }
                 Command::none()
             }
@@ -431,9 +467,11 @@ impl Application for Tant {
             Message::Resize(width, height) => {
                 let (cell_w, cell_h) = self.renderer.cell_size();
                 let cols = (width as f32 / cell_w) as u16;
-                let rows = (height as f32 / cell_h) as u16;
+                // Subtract approximate UI height (top bar + input ~60px)
+                let terminal_height = height as f32 - 60.0;
+                let rows = (terminal_height / cell_h) as u16;
                 let pixel_width = width as u16;
-                let pixel_height = height as u16;
+                let pixel_height = terminal_height as u16;
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
                         pane.parser.resize(rows, cols);
@@ -573,36 +611,40 @@ impl Application for Tant {
                 Command::none()
             }
             Message::MouseWheel(delta) => {
-                match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => {
-                        if y > 0.0 {
-                            // Scroll up (show older content)
-                            if self.scroll_offset < usize::MAX / 2 { // Prevent overflow
-                                self.scroll_offset += y.abs() as usize;
-                                self.follow_mode = false;
-                            }
-                        } else if y < 0.0 {
-                            // Scroll down (show newer content)
-                            if self.scroll_offset > 0 {
-                                self.scroll_offset = self.scroll_offset.saturating_sub(y.abs() as usize);
-                                if self.scroll_offset == 0 {
-                                    self.follow_mode = true;
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        match delta {
+                            mouse::ScrollDelta::Lines { y, .. } => {
+                                if y > 0.0 {
+                                    // Scroll up (show older content)
+                                    if pane.scroll_offset < usize::MAX / 2 { // Prevent overflow
+                                        pane.scroll_offset += y.abs() as usize;
+                                        pane.follow_mode = false;
+                                    }
+                                } else if y < 0.0 {
+                                    // Scroll down (show newer content)
+                                    if pane.scroll_offset > 0 {
+                                        pane.scroll_offset = pane.scroll_offset.saturating_sub(y.abs() as usize);
+                                        if pane.scroll_offset == 0 {
+                                            pane.follow_mode = true;
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    }
-                    mouse::ScrollDelta::Pixels { y, .. } => {
-                        // Convert pixels to lines, assuming cell_height
-                        let lines = (y.abs() / 16.0) as usize;
-                        if y > 0.0 {
-                            if self.scroll_offset < usize::MAX / 2 {
-                                self.scroll_offset += lines;
-                                self.follow_mode = false;
-                            }
-                        } else if y < 0.0 && self.scroll_offset > 0 {
-                            self.scroll_offset = self.scroll_offset.saturating_sub(lines);
-                            if self.scroll_offset == 0 {
-                                self.follow_mode = true;
+                            mouse::ScrollDelta::Pixels { y, .. } => {
+                                // Convert pixels to lines, assuming cell_height
+                                let lines = (y.abs() / 16.0) as usize;
+                                if y > 0.0 {
+                                    if pane.scroll_offset < usize::MAX / 2 {
+                                        pane.scroll_offset += lines;
+                                        pane.follow_mode = false;
+                                    }
+                                } else if y < 0.0 && pane.scroll_offset > 0 {
+                                    pane.scroll_offset = pane.scroll_offset.saturating_sub(lines);
+                                    if pane.scroll_offset == 0 {
+                                        pane.follow_mode = true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -611,49 +653,69 @@ impl Application for Tant {
             }
             Message::MouseButtonPressed(button) => {
                 if button == mouse::Button::Left {
-                    self.mouse_button_down = true;
-                    let cell = self.pos_to_cell(self.last_cursor_pos);
-                    self.selection_start = Some(cell);
-                    self.selection_end = Some(cell);
+                    if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                        if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                            pane.mouse_button_down = true;
+                            let cell_w = self.renderer.cell_size().0;
+                            let cell_h = self.renderer.cell_size().1;
+                            let col = (pane.last_cursor_pos.x / cell_w) as usize;
+                            let row = (pane.last_cursor_pos.y / cell_h) as usize;
+                            pane.selection_start = Some((row, col));
+                            pane.selection_end = Some((row, col));
+                        }
+                    }
                 }
                 Command::none()
             }
             Message::MouseCursorMoved(position) => {
-                self.last_cursor_pos = position;
-                if self.mouse_button_down {
-                    let cell = self.pos_to_cell(position);
-                    self.selection_end = Some(cell);
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        pane.last_cursor_pos = position;
+                        if pane.mouse_button_down {
+                            let cell_w = self.renderer.cell_size().0;
+                            let cell_h = self.renderer.cell_size().1;
+                            let col = (position.x / cell_w) as usize;
+                            let row = (position.y / cell_h) as usize;
+                            pane.selection_end = Some((row, col));
+                        }
+                    }
                 }
                 Command::none()
             }
             Message::MouseButtonReleased(button) => {
                 if button == mouse::Button::Left {
-                    self.mouse_button_down = false;
+                    if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                        if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                            pane.mouse_button_down = false;
+                        }
+                    }
                 }
                 Command::none()
             }
             Message::CopySelected => {
-                if let (Some(tab), Some(start), Some(end)) = (self.layout.get(self.active_tab), self.selection_start, self.selection_end) {
+                if let Some(tab) = self.layout.get(self.active_tab) {
                     if let Some(pane) = tab.panes.get(tab.active_pane) {
-                        let contents = pane.parser.screen().contents();
-                        let lines: Vec<&str> = contents.lines().collect();
-                        let mut selected = String::new();
-                        let (start_line, start_col) = start.min(end);
-                        let (end_line, end_col) = start.max(end);
-                        for line_idx in start_line..=end_line {
-                            if let Some(line) = lines.get(line_idx) {
-                                let start_c = if line_idx == start_line { start_col } else { 0 };
-                                let end_c = if line_idx == end_line { end_col } else { line.len() };
-                                if start_c < line.len() {
-                                    let end_c = end_c.min(line.len());
-                                    selected.push_str(&line[start_c..end_c]);
-                                    if line_idx < end_line {
-                                        selected.push('\n');
+                        if let (Some(start), Some(end)) = (pane.selection_start, pane.selection_end) {
+                            let contents = pane.parser.screen().contents();
+                            let lines: Vec<&str> = contents.lines().collect();
+                            let mut selected = String::new();
+                            let (start_line, start_col) = start.min(end);
+                            let (end_line, end_col) = start.max(end);
+                            for line_idx in start_line..=end_line {
+                                if let Some(line) = lines.get(line_idx) {
+                                    let start_c = if line_idx == start_line { start_col } else { 0 };
+                                    let end_c = if line_idx == end_line { end_col } else { line.len() };
+                                    if start_c < line.len() {
+                                        let end_c = end_c.min(line.len());
+                                        selected.push_str(&line[start_c..end_c]);
+                                        if line_idx < end_line {
+                                            selected.push('\n');
+                                        }
                                     }
                                 }
                             }
+                            return clipboard::write(selected);
                         }
-                        return clipboard::write(selected);
                     }
                 }
                 Command::none()
@@ -663,18 +725,65 @@ impl Application for Tant {
     }
 
     fn view(&self) -> Element<Message> {
-        const EMPTY_STR: &str = "";
+        // Top bar
+        let mut top_row = Row::new().spacing(3).padding([2, 5]);
+        let ai_toggle = Button::new(if self.ai_settings.enabled { "Disable AI" } else { "Enable AI" })
+            .on_press(Message::ToggleAiEnabled);
+        top_row = top_row.push(ai_toggle);
+
+        // AI buttons - only show if enabled
+        if self.ai_settings.enabled {
+            top_row = top_row
+                .push(Button::new("Explain").on_press(Message::AiExplainError))
+                .push(Button::new("Fix").on_press(Message::AiSuggestFix))
+                .push(Button::new("Cmd").on_press(Message::AiGenerateCommand))
+                .push(Button::new("Sum").on_press(Message::AiSummarizeOutput));
+        }
+
+        // Copy button if selection active
         if let Some(tab) = self.layout.get(self.active_tab) {
             if let Some(pane) = tab.panes.get(tab.active_pane) {
-                self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset, self.selection_start, self.selection_end)
-            } else {
-                let dummy_parser = TerminalParser::new(24, 80);
-                self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset, self.selection_start, self.selection_end)
+                if pane.selection_start.is_some() {
+                    top_row = top_row.push(Button::new("Copy").on_press(Message::CopySelected));
+                }
             }
+        }
+
+        let layout_view = if let Some(tab) = self.layout.get(self.active_tab) {
+            self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset, self.selection_start, self.selection_end)
-        }
+            self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, 0, None, None)
+        };
+
+        // Text input for commands
+        let text_input = if let Some(tab) = self.layout.get(self.active_tab) {
+            if let Some(pane) = tab.panes.get(tab.active_pane) {
+                TextInput::new("Type command...", &pane.current_command)
+                    .on_input(Message::TerminalInput)
+                    .on_submit(Message::TerminalSubmit)
+                    .padding(3)
+                    .width(Length::Fill)
+            } else {
+                TextInput::new("Type command...", "")
+                    .on_input(Message::TerminalInput)
+                    .on_submit(Message::TerminalSubmit)
+                    .padding(3)
+                    .width(Length::Fill)
+            }
+        } else {
+            TextInput::new("Type command...", "")
+                .on_input(Message::TerminalInput)
+                .on_submit(Message::TerminalSubmit)
+                .padding(3)
+                .width(Length::Fill)
+        };
+
+        Column::new()
+            .push(top_row)
+            .push(text_input)
+            .push(layout_view)
+            .into()
     }
 
     fn theme(&self) -> Theme {
@@ -736,6 +845,41 @@ impl Application for Tant {
             }
         });
         Subscription::batch(vec![time_sub, event_sub])
+    }
+}
+
+impl Tant {
+    fn build_layout_view<'a>(&'a self, node: &LayoutNode, panes: &'a [Pane]) -> Element<'a, Message> {
+        match node {
+            LayoutNode::Leaf { pane_id } => {
+                if let Some(pane) = panes.get(*pane_id) {
+                    self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end)
+                } else {
+                    let dummy_parser = TerminalParser::new(24, 80);
+                    self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, 0, None, None)
+                }
+            }
+            LayoutNode::Split { axis, ratio, left, right } => {
+                let left_view = self.build_layout_view(left, panes);
+                let right_view = self.build_layout_view(right, panes);
+                match axis {
+                    Axis::Horizontal => {
+                        Row::new()
+                            .push(container(left_view).width(Length::FillPortion((ratio * 100.0) as u16)))
+                            .push(container(right_view).width(Length::FillPortion(((1.0 - ratio) * 100.0) as u16)))
+                            .height(Length::Fill)
+                            .into()
+                    }
+                    Axis::Vertical => {
+                        Column::new()
+                            .push(container(left_view).height(Length::FillPortion((ratio * 100.0) as u16)))
+                            .push(container(right_view).height(Length::FillPortion(((1.0 - ratio) * 100.0) as u16)))
+                            .width(Length::Fill)
+                            .into()
+                    }
+                }
+            }
+        }
     }
 }
 
