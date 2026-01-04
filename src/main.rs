@@ -2,17 +2,28 @@ use iced::{Application, Command, Element, Settings, Subscription, Theme, time, w
 use iced::keyboard::{self, Key, Modifiers};
 use iced::widget::{Row, Column, container, TextInput};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 mod pty;
 mod parser;
 mod renderer;
 
 use parser::{TerminalParser, ParserEvent};
-use renderer::TerminalRenderer;
+use renderer::{TerminalRenderer, StyleRun};
 use pty::PtyManager;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThemeConfig {
+    pub font_family: String,
+    pub font_size: f32,
+    pub enable_ligatures: bool,
+    pub padding: f32,
+    pub line_height: f32,
+    pub colors: HashMap<String, [f32; 3]>, // RGB values
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
@@ -47,6 +58,7 @@ pub struct Pane {
     pub selection_end: Option<(usize, usize)>,
     pub mouse_button_down: bool,
     pub last_cursor_pos: Point,
+    pub title: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -54,12 +66,15 @@ pub struct SerializablePane {
     pub history: Vec<Block>,
     pub current_command: String,
     pub working_directory: String,
+    pub title: String,
+    pub scroll_offset: usize,
 }
 
 pub struct Tab {
     pub root: LayoutNode,
     pub panes: Vec<Pane>,
     pub active_pane: usize,
+    pub title: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,6 +82,7 @@ pub struct SerializableTab {
     pub root: LayoutNode,
     pub panes: Vec<SerializablePane>,
     pub active_pane: usize,
+    pub title: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -99,6 +115,8 @@ pub enum PaletteAction {
     SwitchTab(usize),
     RunPinnedCommand(usize),
     ToggleAi,
+    ExportTheme,
+    ImportTheme,
     // Add more as needed
 }
 
@@ -136,6 +154,7 @@ impl Pane {
             selection_end: None,
             mouse_button_down: false,
             last_cursor_pos: Point { x: 0.0, y: 0.0 },
+    title: "Terminal".to_string(),
         })
     }
 }
@@ -180,6 +199,8 @@ pub enum Message {
     UpdatePaletteQuery(String),
     UpdatePaletteSelection(isize),
     ExecutePaletteAction(PaletteAction),
+    ExportTheme,
+    ImportTheme,
     None,
 }
 
@@ -193,6 +214,9 @@ struct Tant {
     show_command_palette: bool,
     palette_query: String,
     palette_selected: usize,
+    render_cache: Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>,
+    row_hashes: Arc<Mutex<HashMap<(usize, usize, u16), u64>>>,
+    theme_config: ThemeConfig,
 }
 
 impl Tant {
@@ -260,9 +284,12 @@ impl Tant {
                         history: pane.history.clone(),
                         current_command: pane.current_command.clone(),
                         working_directory: pane.working_directory.clone(),
+                        title: pane.title.clone(),
+                        scroll_offset: pane.scroll_offset,
                     }
                 }).collect(),
                 active_pane: tab.active_pane,
+                title: tab.title.clone(),
             }
         }).collect();
         let layout = Layout {
@@ -278,6 +305,18 @@ impl Tant {
         let json = std::fs::read_to_string("session.json")?;
         let layout: Layout = serde_json::from_str(&json)?;
         Ok(layout)
+    }
+
+    fn export_theme(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let json = serde_json::to_string_pretty(&self.theme_config)?;
+        std::fs::write("theme.json", json)?;
+        Ok(())
+    }
+
+    fn import_theme(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let json = std::fs::read_to_string("theme.json")?;
+        self.theme_config = serde_json::from_str(&json)?;
+        Ok(())
     }
 
     fn collect_ai_data(&self, include_current: bool, last_n: usize) -> String {
@@ -346,6 +385,16 @@ impl Tant {
             PaletteAction::ToggleAi => {
                 self.ai_settings.enabled = !self.ai_settings.enabled;
             }
+            PaletteAction::ExportTheme => {
+                if let Err(e) = self.export_theme() {
+                    eprintln!("Failed to export theme: {}", e);
+                }
+            }
+            PaletteAction::ImportTheme => {
+                if let Err(e) = self.import_theme() {
+                    eprintln!("Failed to import theme: {}", e);
+                }
+            }
         }
     }
 
@@ -390,6 +439,8 @@ impl Tant {
             ("Split Pane Vertical", PaletteAction::SplitPaneVertical),
             ("Close Pane", PaletteAction::ClosePane),
             ("Toggle AI", PaletteAction::ToggleAi),
+            ("Export Theme", PaletteAction::ExportTheme),
+            ("Import Theme", PaletteAction::ImportTheme),
         ];
 
         // Add switch tab actions
@@ -432,9 +483,11 @@ impl Application for Tant {
                     pane.history = saved_pane.history;
                     pane.current_command = saved_pane.current_command;
                     pane.working_directory = saved_pane.working_directory;
+                    pane.title = saved_pane.title;
+                    pane.scroll_offset = saved_pane.scroll_offset;
                     panes.push(pane);
                 }
-                let tab = Tab { root: saved_tab.root, panes, active_pane: saved_tab.active_pane };
+                let tab = Tab { root: saved_tab.root, panes, active_pane: saved_tab.active_pane, title: saved_tab.title };
                 tabs.push(tab);
             }
             (tabs, saved_layout.active_tab)
@@ -442,7 +495,7 @@ impl Application for Tant {
             // Default: single pane
             let pane = Pane::new(&shell, None).unwrap();
             let root = LayoutNode::Leaf { pane_id: 0 };
-            let tab = Tab { root, panes: vec![pane], active_pane: 0 };
+            let tab = Tab { root, panes: vec![pane], active_pane: 0, title: "Tab 1".to_string() };
             (vec![tab], 0)
         };
         let renderer = TerminalRenderer::new();
@@ -454,8 +507,16 @@ impl Application for Tant {
             provider: "mock".to_string(),
             api_key: None,
         };
+        let theme_config = ThemeConfig {
+            font_family: "Monospace".to_string(),
+            font_size: 16.0,
+            enable_ligatures: false,
+            padding: 15.0,
+            line_height: 1.2,
+            colors: HashMap::new(), // Will add defaults later
+        };
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0 },
+            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -602,7 +663,7 @@ impl Application for Tant {
                 Command::none()
             }
             Message::Resize(width, height) => {
-                let (cell_w, cell_h) = self.renderer.cell_size();
+                let (cell_w, cell_h) = self.renderer.cell_size(&self.theme_config);
                 let cols = (width as f32 / cell_w) as u16;
                 let rows = (height as f32 / cell_h) as u16;
                 let pixel_width = width as u16;
@@ -615,6 +676,9 @@ impl Application for Tant {
                         }
                     }
                 }
+                // Clear render caches on resize
+                self.render_cache.lock().unwrap().clear();
+                self.row_hashes.lock().unwrap().clear();
                 Command::none()
             }
             Message::UpdateCommand(index, new_cmd) => {
@@ -813,8 +877,8 @@ impl Application for Tant {
                     if let Some(tab) = self.layout.get_mut(self.active_tab) {
                         if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                             pane.mouse_button_down = true;
-                            let cell_w = self.renderer.cell_size().0;
-                            let cell_h = self.renderer.cell_size().1;
+                            let cell_w = self.renderer.cell_size(&self.theme_config).0;
+                            let cell_h = self.renderer.cell_size(&self.theme_config).1;
                             let col = (pane.last_cursor_pos.x / cell_w) as usize;
                             let row = (pane.last_cursor_pos.y / cell_h) as usize;
                             pane.selection_start = Some((row, col));
@@ -829,8 +893,8 @@ impl Application for Tant {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         pane.last_cursor_pos = position;
                         if pane.mouse_button_down {
-                            let cell_w = self.renderer.cell_size().0;
-                            let cell_h = self.renderer.cell_size().1;
+                            let cell_w = self.renderer.cell_size(&self.theme_config).0;
+                            let cell_h = self.renderer.cell_size(&self.theme_config).1;
                             let col = (position.x / cell_w) as usize;
                             let row = (position.y / cell_h) as usize;
                             pane.selection_end = Some((row, col));
@@ -910,6 +974,18 @@ impl Application for Tant {
                 self.execute_palette_action(action);
                 Command::none()
             }
+            Message::ExportTheme => {
+                if let Err(e) = self.export_theme() {
+                    eprintln!("Failed to export theme: {}", e);
+                }
+                Command::none()
+            }
+            Message::ImportTheme => {
+                if let Err(e) = self.import_theme() {
+                    eprintln!("Failed to import theme: {}", e);
+                }
+                Command::none()
+            }
             Message::PtyData(_) | Message::ParserEvents(_) | Message::None => Command::none(),
         }
     }
@@ -919,7 +995,7 @@ impl Application for Tant {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None)
+            self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config)
         };
 
         if self.show_command_palette {
@@ -1020,10 +1096,10 @@ impl Tant {
         match node {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
-                    self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end)
+                    self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config)
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
-                    self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None)
+                    self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config)
                 }
             }
             LayoutNode::Split { axis, ratio, left, right } => {

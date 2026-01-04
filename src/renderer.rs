@@ -8,7 +8,82 @@ use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
 use vt100;
 use chrono::Utc;
-use crate::{Message, AiSettings, Block};
+use crate::{Message, AiSettings, Block, ThemeConfig};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher, DefaultHasher};
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone)]
+pub struct StyleRun {
+    text: String,
+    fg: Color,
+    bg: Color,
+    x: f32,
+    width: f32,
+}
+
+fn compute_row_hash(screen: &vt100::Screen, row: u16) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let cols = screen.size().0;
+    for col in 0..cols {
+        if let Some(cell) = screen.cell(row, col) {
+            cell.contents().hash(&mut hasher);
+            format!("{:?}", cell.fgcolor()).hash(&mut hasher);
+            format!("{:?}", cell.bgcolor()).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn compute_runs(screen: &vt100::Screen, row: u16, cell_width: f32, _cell_height: f32) -> Vec<StyleRun> {
+    let cols = screen.size().0;
+    let mut runs = vec![];
+    let mut col = 0;
+    while col < cols {
+        if let Some(cell) = screen.cell(row, col) {
+            let start_col = col;
+            let fg = color_to_iced(cell.fgcolor());
+            let bg = bgcolor_to_iced(cell.bgcolor());
+            let mut text = cell.contents().to_string();
+            col += 1;
+            while col < cols {
+                if let Some(next_cell) = screen.cell(row, col) {
+                    if color_to_iced(next_cell.fgcolor()) == fg && bgcolor_to_iced(next_cell.bgcolor()) == bg {
+                        text.push_str(&next_cell.contents());
+                        col += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            let x = start_col as f32 * cell_width;
+            let width = (col - start_col) as f32 * cell_width;
+            runs.push(StyleRun { text, fg, bg, x, width });
+        } else {
+            col += 1;
+        }
+    }
+    runs
+}
+
+fn draw_runs(frame: &mut Frame, runs: &[StyleRun], y: f32, cell_height: f32) {
+    for run in runs {
+        frame.fill_rectangle(Point::new(run.x, y), Size::new(run.width, cell_height), run.bg);
+        if !run.text.is_empty() && run.text != " ".repeat(run.text.len()) {
+            let text_canvas = canvas::Text {
+                content: run.text.clone(),
+                position: Point::new(run.x, y),
+                size: Pixels(cell_height),
+                color: run.fg,
+                font: Font::MONOSPACE,
+                ..canvas::Text::default()
+            };
+            frame.fill_text(text_canvas);
+        }
+    }
+}
 
 pub struct TerminalRenderer;
 
@@ -57,28 +132,33 @@ impl TerminalRenderer {
         TerminalRenderer
     }
 
-    pub fn cell_size(&self) -> (f32, f32) {
-        (8.0, 16.0)
+    pub fn cell_size(&self, theme_config: &ThemeConfig) -> (f32, f32) {
+        (8.0, theme_config.line_height * theme_config.font_size)
     }
 
-    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, _search_query: &str, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>) -> Element<'a, Message> {
+    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, _search_query: &str, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
         // Use raw terminal mode for TUI apps (vim, top, etc.), block mode for normal shell
         if alt_screen_active {
             Canvas::new(TerminalCanvas {
                 screen: screen.clone(),
                 cell_width: 8.0,
-                cell_height: 16.0,
+                cell_height: theme_config.line_height * theme_config.font_size,
+                render_cache: render_cache.clone(),
+                row_hashes: row_hashes.clone(),
+                tab_id,
+                pane_id,
+                theme_config: theme_config.clone(),
             })
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
         } else {
-            self.render_blocks(history, current, current_command)
+            self.render_blocks(history, current, current_command, theme_config)
         }
     }
 
-    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str) -> Element<'a, Message> {
-        let mut column = Column::new().spacing(5).padding(15);
+    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
+        let mut column = Column::new().spacing(5).padding(theme_config.padding as u16);
 
         // Show welcome message if no history
         if history.is_empty() && current.is_none() {
@@ -89,13 +169,13 @@ impl TerminalRenderer {
 
         // Render history blocks
         for (index, block) in history.iter().enumerate() {
-            let block_widget = self.render_block(block, index);
+            let block_widget = self.render_block(block, index, theme_config);
             column = column.push(block_widget);
         }
 
         // Render current block if running
         if let Some(block) = current {
-            let current_block_widget = self.render_current_block(block);
+            let current_block_widget = self.render_current_block(block, theme_config);
             column = column.push(current_block_widget);
         }
 
@@ -108,8 +188,8 @@ impl TerminalRenderer {
             .on_input(Message::TerminalInput)
             .on_submit(Message::TerminalSubmit)
             .padding(18)
-            .size(20.0)
-            .font(Font::MONOSPACE);
+            .size(theme_config.font_size)
+            .font(Font::MONOSPACE); // TODO: use theme_config.font_family
         
         // Wrap input in a highly visible container
         let input_with_bg = Container::new(input)
@@ -192,7 +272,7 @@ impl TerminalRenderer {
             .into()
     }
 
-    fn render_block<'a>(&self, block: &'a Block, index: usize) -> Element<'a, Message> {
+    fn render_block<'a>(&self, block: &'a Block, index: usize, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
         let (status_symbol, status_detail, _status_color) = match block.exit_code {
             Some(0) => ("✓".to_string(), String::new(), Color::from_rgb(0.2, 0.8, 0.2)),
             Some(code) => ("✗".to_string(), format!(" {}", code), Color::from_rgb(0.9, 0.3, 0.3)),
@@ -207,11 +287,11 @@ impl TerminalRenderer {
         // Command line with prompt symbol
         let prompt = Text::new("❯ ")
             .font(Font::MONOSPACE)
-            .size(14.0);
-        
+            .size(theme_config.font_size);
+
         let command = Text::new(&block.command)
             .font(Font::MONOSPACE)
-            .size(14.0);
+            .size(theme_config.font_size);
 
         let status = Text::new(status_display)
             .size(12.0);
@@ -252,7 +332,7 @@ impl TerminalRenderer {
         if !block.collapsed && !block.output.is_empty() {
             let output_text = Text::new(&block.output)
                 .font(Font::MONOSPACE)
-                .size(13.0);
+                .size(theme_config.font_size - 3.0);
             let output_container = Container::new(output_text)
                 .padding(8);
             column = column.push(output_container);
@@ -264,7 +344,7 @@ impl TerminalRenderer {
             .into()
     }
 
-    fn render_current_block<'a>(&self, block: &'a Block) -> Element<'a, Message> {
+    fn render_current_block<'a>(&self, block: &'a Block, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
         let duration_text = block.started_at
             .map(|start| format!("{:.2}s", (Utc::now() - start).num_milliseconds() as f64 / 1000.0))
             .unwrap_or_else(|| "...".to_string());
@@ -272,11 +352,11 @@ impl TerminalRenderer {
         // Command line with prompt symbol
         let prompt = Text::new("❯ ")
             .font(Font::MONOSPACE)
-            .size(14.0);
-        
+            .size(theme_config.font_size);
+
         let command = Text::new(&block.command)
             .font(Font::MONOSPACE)
-            .size(14.0);
+            .size(theme_config.font_size);
 
         let status = Text::new("⏳")
             .size(12.0);
@@ -304,7 +384,7 @@ impl TerminalRenderer {
         if !block.output.is_empty() {
             let output_text = Text::new(&block.output)
                 .font(Font::MONOSPACE)
-                .size(13.0);
+                .size(theme_config.font_size - 3.0);
             let output_container = Container::new(output_text)
                 .padding(8);
             column = column.push(output_container);
@@ -321,6 +401,11 @@ pub struct TerminalCanvas {
     pub screen: vt100::Screen,
     pub cell_width: f32,
     pub cell_height: f32,
+    pub render_cache: Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>,
+    pub row_hashes: Arc<Mutex<HashMap<(usize, usize, u16), u64>>>,
+    pub tab_id: usize,
+    pub pane_id: usize,
+    pub theme_config: ThemeConfig,
 }
 
 impl Program<Message> for TerminalCanvas {
@@ -335,33 +420,23 @@ impl Program<Message> for TerminalCanvas {
         let size = self.screen.size();
         let rows = size.1 as usize;
         let cols = size.0 as usize;
-        
+
         eprintln!("Canvas bounds: {:?}, Screen size: {}x{}", bounds, cols, rows);
 
+        let mut cache = self.render_cache.lock().unwrap();
+        let mut hashes = self.row_hashes.lock().unwrap();
         for row in 0..rows {
-            for col in 0..cols {
-                if let Some(cell) = self.screen.cell(row as u16, col as u16) {
-                    let x = col as f32 * self.cell_width;
-                    let y = row as f32 * self.cell_height;
-
-                    // Draw background
-                    let bg = bgcolor_to_iced(cell.bgcolor());
-                    frame.fill_rectangle(Point::new(x, y), Size::new(self.cell_width, self.cell_height), bg);
-
-                    // Draw text only if content is not empty
-                    let content = cell.contents();
-                    if !content.is_empty() && content != " " {
-                        let fg = color_to_iced(cell.fgcolor());
-                        let text = canvas::Text {
-                            content: content.into(),
-                            position: Point::new(x, y),
-                            size: Pixels(self.cell_height),
-                            color: fg,
-                            font: Font::MONOSPACE,
-                            ..canvas::Text::default()
-                        };
-                        frame.fill_text(text);
-                    }
+            let y = row as f32 * self.cell_height;
+            let key = (self.tab_id, self.pane_id, row as u16);
+            let hash = compute_row_hash(&self.screen, row as u16);
+            if hashes.get(&key) != Some(&hash) {
+                let runs = compute_runs(&self.screen, row as u16, self.cell_width, self.cell_height);
+                cache.insert(key, runs.clone());
+                hashes.insert(key, hash);
+                draw_runs(&mut frame, &runs, y, self.cell_height);
+            } else {
+                if let Some(runs) = cache.get(&key) {
+                    draw_runs(&mut frame, runs, y, self.cell_height);
                 }
             }
         }
