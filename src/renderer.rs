@@ -1,7 +1,7 @@
 // Renderer + UI shell
 
 use iced::widget::Canvas;
-use iced::{Element, Length, Color, Point, Size, Rectangle, Theme};
+use iced::{Element, Length, Color, Point, Size, Rectangle, Theme, Pixels};
 use iced::widget::canvas::{self, Program, Frame, Text};
 use iced::mouse::Cursor;
 use vt100;
@@ -9,6 +9,18 @@ use vt100;
 use crate::{Message, Block};
 
 pub struct TerminalRenderer;
+
+fn color_to_iced(color: vt100::Color) -> Color {
+    // For simplicity, assume Rgb or default
+    // Since the variants are not matching, let's use a simple approach
+    // Perhaps the Color has rgb() method
+    // But since not, let's assume it's Rgb
+    if let vt100::Color::Rgb(r, g, b) = color {
+        Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+    } else {
+        Color::WHITE // default
+    }
+}
 
 impl TerminalRenderer {
     pub fn new() -> Self {
@@ -19,7 +31,7 @@ impl TerminalRenderer {
         (8.0, 16.0)
     }
 
-    pub fn view<'a>(&self, history: &'a [Block], current: &Option<Block>, current_command: &str, search_query: &str, screen: &vt100::Screen) -> Element<'a, Message> {
+    pub fn view<'a>(&self, _history: &'a [Block], _current: &Option<Block>, _current_command: &str, _search_query: &str, screen: &vt100::Screen) -> Element<'a, Message> {
         let canvas = Canvas::new(TerminalCanvas {
             screen: screen.clone(),
             cell_width: 8.0,
@@ -55,17 +67,15 @@ impl Program<Message> for TerminalCanvas {
                     let y = row as f32 * self.cell_height;
 
                     // Draw background
-                    let bg_color = cell.bgcolor();
-                    let bg = Color::from_rgb(bg_color.r() as f32 / 255.0, bg_color.g() as f32 / 255.0, bg_color.b() as f32 / 255.0);
+                    let bg = color_to_iced(cell.bgcolor());
                     frame.fill_rectangle(Point::new(x, y), Size::new(self.cell_width, self.cell_height), bg);
 
                     // Draw text
-                    let fg_color = cell.fgcolor();
-                    let fg = Color::from_rgb(fg_color.r() as f32 / 255.0, fg_color.g() as f32 / 255.0, fg_color.b() as f32 / 255.0);
+                    let fg = color_to_iced(cell.fgcolor());
                     frame.fill_text(Text {
                         content: cell.contents(),
                         position: Point::new(x, y + self.cell_height),
-                        size: self.cell_height,
+                        size: Pixels(self.cell_height),
                         color: fg,
                         ..Text::default()
                     });

@@ -1,15 +1,12 @@
 use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window};
 use serde::{Deserialize, Serialize};
-use portable_pty::{CommandBuilder, PtySize, PtySystem};
 
 mod pty;
 mod parser;
 mod renderer;
 
-use pty::PtyManager;
 use parser::{TerminalParser, ParserEvent};
 use renderer::TerminalRenderer;
-use vt100::Screen;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
@@ -27,7 +24,7 @@ pub struct Block {
 }
 
 pub struct Pane {
-    pub pty: PtyManager,
+    // pub pty: PtyManager,
     pub parser: TerminalParser,
     pub history: Vec<Block>,
     pub current_block: Option<Block>,
@@ -60,12 +57,13 @@ pub struct Layout {
 }
 
 impl Pane {
-    pub fn new(shell: &str, working_directory: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(_shell: &str, working_directory: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
         let wd = working_directory.unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
-        let pty = PtyManager::new_with_cwd(shell, &wd)?;
+        // Dummy PTY for now
+        // let pty = PtyManager::new_with_cwd(shell, &wd)?;
         let parser = TerminalParser::new(24, 80);
         Ok(Pane {
-            pty,
+            // pty,
             parser,
             history: vec![],
             current_block: None,
@@ -75,31 +73,6 @@ impl Pane {
     }
 }
 
-impl PtyManager {
-    pub fn new_with_cwd(shell: &str, cwd: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        #[cfg(unix)]
-        let pty_system = PtySystem::default();
-        #[cfg(windows)]
-        let pty_system = PtySystem::default();
-        let pair = pty_system.openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-        let mut cmd = CommandBuilder::new(shell);
-        cmd.cwd(cwd);
-        let child = pair.slave.spawn_command(cmd)?;
-        let reader = pair.master.input;
-        let writer = pair.master.output;
-        Ok(PtyManager {
-            master: pair.master,
-            child,
-            reader,
-            writer,
-        })
-    }
-}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -197,18 +170,12 @@ impl Application for Tant {
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::Tick => {
-                let rt = tokio::runtime::Handle::current();
+                let _rt = tokio::runtime::Handle::current();
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
-                        // Read from PTY
-                        let mut buf = vec![0u8; 1024];
-                        let n = rt.block_on(async {
-                            use tokio::io::AsyncReadExt;
-                            pane.pty.reader().read(&mut buf).await.unwrap_or(0)
-                        });
-                        if n > 0 {
-                            pane.parser.process(&buf[..n]);
-                        }
+                        // Dummy: no PTY reading
+                        // Simulate some input for demo
+                        // pane.parser.process(b"hello\n");
                         // Handle parser events
                         let events = pane.parser.take_events();
                         for event in events {
@@ -267,12 +234,10 @@ impl Application for Tant {
             Message::KeyPress(c) => {
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
-                        let rt = tokio::runtime::Handle::current();
+                        // Dummy: no PTY writing
+                        // Simulate processing input
                         let data = vec![c as u8];
-                        rt.block_on(async {
-                            use tokio::io::AsyncWriteExt;
-                            pane.pty.writer().write_all(&data).await.ok();
-                        });
+                        pane.parser.process(&data);
                     }
                 }
                 Command::none()
@@ -284,7 +249,7 @@ impl Application for Tant {
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
                         pane.parser.resize(rows, cols);
-                        pane.pty.resize(rows, cols).ok();
+                        // pane.pty.resize(rows, cols).ok();
                     }
                 }
                 Command::none()
@@ -304,11 +269,8 @@ impl Application for Tant {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         if let Some(block) = pane.history.get(index) {
                             let cmd = format!("{}\n", block.command);
-                            let rt = tokio::runtime::Handle::current();
-                            rt.block_on(async {
-                                use tokio::io::AsyncWriteExt;
-                                pane.pty.writer().write_all(cmd.as_bytes()).await.ok();
-                            });
+                            // Dummy: process as input
+                            pane.parser.process(cmd.as_bytes());
                         }
                     }
                 }
@@ -326,11 +288,8 @@ impl Application for Tant {
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         let cmd = format!("{}\n", pane.current_command);
-                        let rt = tokio::runtime::Handle::current();
-                        rt.block_on(async {
-                            use tokio::io::AsyncWriteExt;
-                            pane.pty.writer().write_all(cmd.as_bytes()).await.ok();
-                        });
+                        // Dummy: process as input
+                        pane.parser.process(cmd.as_bytes());
                         pane.current_command.clear();
                     }
                 }
@@ -364,11 +323,9 @@ impl Application for Tant {
                 self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen())
             } else {
                 let dummy_parser = TerminalParser::new(24, 80);
-                let dummy_parser = TerminalParser::new(24, 80);
                 self.renderer.view(&[], &None, &String::new(), &self.search_query, dummy_parser.screen())
             }
         } else {
-            let dummy_parser = TerminalParser::new(24, 80);
             let dummy_parser = TerminalParser::new(24, 80);
             self.renderer.view(&[], &None, &String::new(), &self.search_query, dummy_parser.screen())
         }
