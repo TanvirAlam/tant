@@ -361,14 +361,16 @@ impl Application for Tant {
     fn view(&self) -> Element<Message> {
         if let Some(tab) = self.layout.get(self.active_tab) {
             if let Some(pane) = tab.panes.get(tab.active_pane) {
-                self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query)
+                self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen())
             } else {
                 let dummy_parser = TerminalParser::new(24, 80);
-                self.renderer.view(&[], &None, &String::new(), &self.search_query)
+                let dummy_parser = TerminalParser::new(24, 80);
+                self.renderer.view(&[], &None, &String::new(), &self.search_query, dummy_parser.screen())
             }
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, &String::new(), &self.search_query)
+            let dummy_parser = TerminalParser::new(24, 80);
+            self.renderer.view(&[], &None, &String::new(), &self.search_query, dummy_parser.screen())
         }
     }
 

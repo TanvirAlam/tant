@@ -19,7 +19,7 @@ pub struct TerminalParser {
 
 impl TerminalParser {
     pub fn new(rows: u16, cols: u16) -> Self {
-        let parser = Parser::new(rows, cols, 0);
+        let parser = Parser::new(rows, cols, 1000); // Large scrollback
         TerminalParser { parser, events: vec![] }
     }
 

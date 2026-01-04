@@ -1,7 +1,10 @@
 // Renderer + UI shell
 
-use iced::widget::{Column, Text, TextInput, Button, Row};
-use iced::{Element, Length};
+use iced::widget::Canvas;
+use iced::{Element, Length, Color, Point, Size, Rectangle, Theme};
+use iced::widget::canvas::{self, Program, Frame, Text};
+use iced::mouse::Cursor;
+use vt100;
 
 use crate::{Message, Block};
 
@@ -16,45 +19,60 @@ impl TerminalRenderer {
         (8.0, 16.0)
     }
 
-    pub fn view<'a>(&self, history: &'a [Block], current: &Option<Block>, current_command: &str, search_query: &str) -> Element<'a, Message> {
-        let mut column = Column::new().spacing(10).padding(10);
+    pub fn view<'a>(&self, history: &'a [Block], current: &Option<Block>, current_command: &str, search_query: &str, screen: &vt100::Screen) -> Element<'a, Message> {
+        let canvas = Canvas::new(TerminalCanvas {
+            screen: screen.clone(),
+            cell_width: 8.0,
+            cell_height: 16.0,
+        })
+        .width(Length::Fill)
+        .height(Length::Fill);
 
-        // Search input
-        let search_input = TextInput::new("Search", search_query)
-            .on_input(Message::UpdateSearch);
-        column = column.push(search_input);
+        canvas.into()
+    }
+}
 
-        // Filter history
-        let filtered: Vec<(usize, &Block)> = history.iter().enumerate()
-            .filter(|(_, b)| search_query.is_empty() || b.command.contains(search_query) || b.output.contains(search_query))
-            .collect();
+pub struct TerminalCanvas {
+    pub screen: vt100::Screen,
+    pub cell_width: f32,
+    pub cell_height: f32,
+}
 
-        for (orig_i, block) in filtered {
-            let command_input = TextInput::new("", &block.command)
-                .on_input(move |s| Message::UpdateCommand(orig_i, s));
-            let rerun_button = Button::new("Run").on_press(Message::RerunCommand(orig_i));
-            let pin_button = Button::new(if block.pinned { "Unpin" } else { "Pin" })
-                .on_press(Message::TogglePin(orig_i));
-            let command_row = Row::new().spacing(10)
-                .push(command_input)
-                .push(rerun_button)
-                .push(pin_button);
-            let status = Text::new(format!("Status: {:?}, Dir: {}, Branch: {:?}", block.status, block.directory, block.git_branch));
-            let duration = Text::new(format!("Duration: {:?}", block.duration));
-            let output = Text::new(&block.output);
-            column = column.push(command_row).push(status).push(duration).push(output);
+impl Program<Message> for TerminalCanvas {
+    type State = ();
+
+    fn draw(&self, _state: &Self::State, renderer: &iced::Renderer, _theme: &Theme, bounds: Rectangle, _cursor: Cursor) -> Vec<canvas::Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+
+        let size = self.screen.size();
+        let rows = size.1 as usize;
+        let cols = size.0 as usize;
+
+        for row in 0..rows {
+            for col in 0..cols {
+                if let Some(cell) = self.screen.cell(row as u16, col as u16) {
+                    let x = col as f32 * self.cell_width;
+                    let y = row as f32 * self.cell_height;
+
+                    // Draw background
+                    let bg_color = cell.bgcolor();
+                    let bg = Color::from_rgb(bg_color.r() as f32 / 255.0, bg_color.g() as f32 / 255.0, bg_color.b() as f32 / 255.0);
+                    frame.fill_rectangle(Point::new(x, y), Size::new(self.cell_width, self.cell_height), bg);
+
+                    // Draw text
+                    let fg_color = cell.fgcolor();
+                    let fg = Color::from_rgb(fg_color.r() as f32 / 255.0, fg_color.g() as f32 / 255.0, fg_color.b() as f32 / 255.0);
+                    frame.fill_text(Text {
+                        content: cell.contents(),
+                        position: Point::new(x, y + self.cell_height),
+                        size: self.cell_height,
+                        color: fg,
+                        ..Text::default()
+                    });
+                }
+            }
         }
 
-        if let Some(block) = current {
-            let command = Text::new(format!("Current Command: {}", block.command));
-            column = column.push(command);
-        }
-
-        let current_input = TextInput::new("Enter command", current_command)
-            .on_input(Message::UpdateCurrent)
-            .on_submit(Message::RunCurrent);
-        column = column.push(current_input);
-
-        column.into()
+        vec![frame.into_geometry()]
     }
 }
