@@ -8,6 +8,8 @@ pub enum ParserEvent {
     CommandStart,
     Command(String),
     CommandEnd(i32),
+    Directory(String),
+    GitBranch(String),
 }
 
 pub struct TerminalParser {
@@ -38,6 +40,22 @@ impl TerminalParser {
                             let command = data_str[cmd_start..cmd_start+end].to_string();
                             self.events.push(ParserEvent::Command(command));
                             i += cmd_start + end;
+                            continue;
+                        }
+                    } else if cmd == "Directory" {
+                        let dir_start = start + semi + 1;
+                        if let Some(end) = data_str[dir_start..].find('\x1b') {
+                            let directory = data_str[dir_start..dir_start+end].to_string();
+                            self.events.push(ParserEvent::Directory(directory));
+                            i += dir_start + end;
+                            continue;
+                        }
+                    } else if cmd == "GitBranch" {
+                        let branch_start = start + semi + 1;
+                        if let Some(end) = data_str[branch_start..].find('\x1b') {
+                            let branch = data_str[branch_start..branch_start+end].to_string();
+                            self.events.push(ParserEvent::GitBranch(branch));
+                            i += branch_start + end;
                             continue;
                         }
                     } else if cmd.starts_with("CommandEnd;") {

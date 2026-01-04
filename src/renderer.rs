@@ -16,15 +16,30 @@ impl TerminalRenderer {
         (8.0, 16.0)
     }
 
-    pub fn view(&self, history: &Vec<Block>, current: &Option<Block>, current_command: &str, _screen: &vt100::Screen) -> Element<Message> {
+    pub fn view(&self, history: &Vec<Block>, current: &Option<Block>, current_command: &str, search_query: &str, _screen: &vt100::Screen) -> Element<Message> {
         let mut column = Column::new().spacing(10).padding(10);
 
-        for (i, block) in history.iter().enumerate() {
+        // Search input
+        let search_input = TextInput::new("Search", search_query)
+            .on_input(Message::UpdateSearch);
+        column = column.push(search_input);
+
+        // Filter history
+        let filtered: Vec<(usize, &Block)> = history.iter().enumerate()
+            .filter(|(_, b)| search_query.is_empty() || b.command.contains(search_query) || b.output.contains(search_query))
+            .collect();
+
+        for (orig_i, block) in filtered {
             let command_input = TextInput::new("", &block.command)
-                .on_input(move |s| Message::UpdateCommand(i, s));
-            let rerun_button = Button::new("Run").on_press(Message::RerunCommand(i));
-            let command_row = Row::new().spacing(10).push(command_input).push(rerun_button);
-            let status = Text::new(format!("Status: {:?}", block.status));
+                .on_input(move |s| Message::UpdateCommand(orig_i, s));
+            let rerun_button = Button::new("Run").on_press(Message::RerunCommand(orig_i));
+            let pin_button = Button::new(if block.pinned { "Unpin" } else { "Pin" })
+                .on_press(Message::TogglePin(orig_i));
+            let command_row = Row::new().spacing(10)
+                .push(command_input)
+                .push(rerun_button)
+                .push(pin_button);
+            let status = Text::new(format!("Status: {:?}, Dir: {}, Branch: {:?}", block.status, block.directory, block.git_branch));
             let duration = Text::new(format!("Duration: {:?}", block.duration));
             let output = Collapsible::new(
                 Text::new("Output"),

@@ -15,6 +15,10 @@ pub struct Block {
     pub status: Option<i32>,
     pub start_time: std::time::Instant,
     pub duration: Option<std::time::Duration>,
+    pub directory: String,
+    pub git_branch: Option<String>,
+    pub host: String,
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +32,8 @@ pub enum Message {
     RerunCommand(usize),
     UpdateCurrent(String),
     RunCurrent,
+    UpdateSearch(String),
+    TogglePin(usize),
     None,
 }
 
@@ -38,6 +44,7 @@ struct Tant {
     history: Vec<Block>,
     current_block: Option<Block>,
     current_command: String,
+    search_query: String,
 }
 
 impl Application for Tant {
@@ -50,7 +57,7 @@ impl Application for Tant {
         let pty = PtyManager::new("bash").unwrap();
         let parser = TerminalParser::new(24, 80);
         let renderer = TerminalRenderer::new();
-        (Tant { pty, parser, renderer, history: vec![], current_block: None, current_command: String::new() }, Command::none())
+        (Tant { pty, parser, renderer, history: vec![], current_block: None, current_command: String::new(), search_query: String::new() }, Command::none())
     }
 
     fn title(&self) -> String {
@@ -85,11 +92,25 @@ impl Application for Tant {
                                 status: None,
                                 start_time: std::time::Instant::now(),
                                 duration: None,
+                                directory: std::env::current_dir().unwrap().to_string_lossy().to_string(),
+                                git_branch: None,
+                                host: "localhost".to_string(), // TODO: get actual host
+                                pinned: false,
                             });
                         }
                         ParserEvent::Command(cmd) => {
                             if let Some(ref mut block) = self.current_block {
                                 block.command = cmd;
+                            }
+                        }
+                        ParserEvent::Directory(dir) => {
+                            if let Some(ref mut block) = self.current_block {
+                                block.directory = dir;
+                            }
+                        }
+                        ParserEvent::GitBranch(branch) => {
+                            if let Some(ref mut block) = self.current_block {
+                                block.git_branch = Some(branch);
                             }
                         }
                         ParserEvent::CommandEnd(status) => {
@@ -152,12 +173,22 @@ impl Application for Tant {
                 self.current_command.clear();
                 Command::none()
             }
+            Message::UpdateSearch(query) => {
+                self.search_query = query;
+                Command::none()
+            }
+            Message::TogglePin(index) => {
+                if let Some(block) = self.history.get_mut(index) {
+                    block.pinned = !block.pinned;
+                }
+                Command::none()
+            }
             Message::PtyData(_) | Message::None => Command::none(),
         }
     }
 
     fn view(&self) -> Element<Message> {
-        self.renderer.view(&self.history, &self.current_block, &self.current_command, self.parser.screen())
+        self.renderer.view(&self.history, &self.current_block, &self.current_command, &self.search_query, self.parser.screen())
     }
 
     fn subscription(&self) -> Subscription<Message> {
