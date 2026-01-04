@@ -1,9 +1,9 @@
 // Renderer + UI shell
 
-use iced::widget::{Canvas, Column, Row, Text, Scrollable, Container};
+use iced::widget::{Canvas, Column, Row, Text, Scrollable, Container, container};
 use iced::widget::button::Button;
 use iced::widget::text_input::TextInput;
-use iced::{Element, Length, Color, Point, Size, Rectangle, Theme, Pixels, Font, Alignment};
+use iced::{Element, Length, Color, Point, Size, Rectangle, Theme, Pixels, Font, Alignment, Border, Background};
 use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
 use vt100;
@@ -80,6 +80,13 @@ impl TerminalRenderer {
     fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str) -> Element<'a, Message> {
         let mut column = Column::new().spacing(5).padding(15);
 
+        // Show welcome message if no history
+        if history.is_empty() && current.is_none() {
+            let welcome = Text::new("Welcome to Tant Terminal\n\nType a command below and press Enter to get started.")
+                .size(14.0);
+            column = column.push(welcome);
+        }
+
         // Render history blocks
         for (index, block) in history.iter().enumerate() {
             let block_widget = self.render_block(block, index);
@@ -94,24 +101,94 @@ impl TerminalRenderer {
 
         let scrollable = Scrollable::new(column)
             .width(Length::Fill)
-            .height(Length::Fill);
+            .height(Length::FillPortion(9));
 
-        // Command input area with better styling
-        let input = TextInput::new("", current_command)
+        // Command input area with better styling and increased height
+        let input = TextInput::new("Type a command here...", current_command)
             .on_input(Message::TerminalInput)
             .on_submit(Message::TerminalSubmit)
-            .padding(12)
-            .size(14.0)
+            .padding(18)
+            .size(20.0)
             .font(Font::MONOSPACE);
-
-        let input_container = Container::new(input)
+        
+        // Wrap input in a highly visible container
+        let input_with_bg = Container::new(input)
             .width(Length::Fill)
+            .padding(4)
+            .style(|_theme: &Theme| container::Appearance {
+                background: Some(Background::Color(Color::from_rgb(0.35, 0.35, 0.35))),
+                border: Border {
+                    color: Color::from_rgb(0.5, 0.7, 1.0),  // Bright blue border
+                    width: 2.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            });
+
+        // Create metadata labels row - always show with fallback values
+        let mut metadata_row = Row::new().spacing(15);
+        
+        let block_for_metadata = current.as_ref().or_else(|| history.last());
+        
+        // Get metadata from block or use fallbacks
+        let (cwd_str, git_branch, host) = if let Some(block) = block_for_metadata {
+            (
+                block.cwd.as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~".to_string()),
+                block.git_branch.clone(),
+                block.host.clone(),
+            )
+        } else {
+            // Fallback values when no blocks exist
+            (
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "~".to_string()),
+                None,
+                "localhost".to_string(),
+            )
+        };
+        
+        // Directory label
+        let dir_label = Row::new()
+            .push(Text::new("📁 ").size(10.0))
+            .push(Text::new(cwd_str).size(10.0).font(Font::MONOSPACE))
+            .spacing(3);
+        metadata_row = metadata_row.push(dir_label);
+        
+        // Git branch label (if available)
+        if let Some(branch) = git_branch {
+            let branch_label = Row::new()
+                .push(Text::new("🌿 ").size(10.0))
+                .push(Text::new(branch).size(10.0).font(Font::MONOSPACE))
+                .spacing(3);
+            metadata_row = metadata_row.push(branch_label);
+        }
+        
+        // Host label
+        let host_label = Row::new()
+            .push(Text::new("💻 ").size(10.0))
+            .push(Text::new(host).size(10.0).font(Font::MONOSPACE))
+            .spacing(3);
+        metadata_row = metadata_row.push(host_label);
+
+        // Input area with labels
+        let input_area = Column::new()
+            .push(input_with_bg)
+            .push(Container::new(metadata_row).padding([5, 12, 8, 12]))
+            .spacing(0);
+
+        let input_container = Container::new(input_area)
+            .width(Length::Fill)
+            .height(Length::FillPortion(1))
             .padding(0);
 
         Column::new()
             .push(scrollable)
             .push(input_container)
             .height(Length::Fill)
+            .spacing(0)
             .into()
     }
 

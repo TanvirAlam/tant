@@ -774,11 +774,12 @@ impl Application for Tant {
     }
 
     fn theme(&self) -> Theme {
+        // Create a dark theme with high-contrast input
         Theme::custom(
             "Tant Dark".to_string(),
             iced::theme::Palette {
-                background: Color::from_rgb(0.11, 0.11, 0.11),
-                text: Color::from_rgb(0.9, 0.9, 0.9),
+                background: Color::from_rgb(0.12, 0.12, 0.12),
+                text: Color::from_rgb(1.0, 1.0, 1.0),  // Pure white text
                 primary: Color::from_rgb(0.4, 0.7, 0.9),
                 success: Color::from_rgb(0.2, 0.8, 0.2),
                 danger: Color::from_rgb(0.9, 0.3, 0.3),
