@@ -5,6 +5,7 @@ use iced::{Element, Length, Color, Point, Size, Rectangle, Theme, Pixels};
 use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
 use vt100;
+use unicode_width::UnicodeWidthStr;
 use crate::{Message, AiSettings, Block};
 
 pub struct TerminalRenderer;
@@ -90,20 +91,27 @@ impl Program<Message> for TerminalCanvas {
                     let x = col as f32 * self.cell_width;
                     let y = row as f32 * self.cell_height;
 
+                    // Calculate display width
+                    let content = cell.contents();
+                    let width = content.width() as f32;
+                    let display_width = if width > 1.0 { width * self.cell_width } else { self.cell_width };
+
                     // Draw background
                     let bg = color_to_iced(cell.bgcolor());
-                    frame.fill_rectangle(Point::new(x, y), Size::new(self.cell_width, self.cell_height), bg);
+                    frame.fill_rectangle(Point::new(x, y), Size::new(display_width, self.cell_height), bg);
 
-                    // Draw text
-                    let fg = color_to_iced(cell.fgcolor());
-                    let text = canvas::Text {
-                        content: cell.contents().into(),
-                        position: Point::new(x, y + self.cell_height),
-                        size: Pixels(self.cell_height),
-                        color: fg,
-                        ..canvas::Text::default()
-                    };
-                    frame.fill_text(text);
+                    // Draw text only if content is not empty
+                    if !content.is_empty() {
+                        let fg = color_to_iced(cell.fgcolor());
+                        let text = canvas::Text {
+                            content: content.into(),
+                            position: Point::new(x, y + self.cell_height),
+                            size: Pixels(self.cell_height),
+                            color: fg,
+                            ..canvas::Text::default()
+                        };
+                        frame.fill_text(text);
+                    }
                 }
             }
         }

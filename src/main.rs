@@ -1,5 +1,7 @@
 use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 
 mod pty;
 mod parser;
@@ -7,6 +9,7 @@ mod renderer;
 
 use parser::{TerminalParser, ParserEvent};
 use renderer::TerminalRenderer;
+use pty::PtyManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
@@ -24,7 +27,7 @@ pub struct Block {
 }
 
 pub struct Pane {
-    // pub pty: PtyManager,
+    pub pty: Arc<TokioMutex<PtyManager>>,
     pub parser: TerminalParser,
     pub history: Vec<Block>,
     pub current_block: Option<Block>,
@@ -67,13 +70,12 @@ pub struct AiSettings {
 }
 
 impl Pane {
-    pub fn new(_shell: &str, working_directory: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(shell: &str, working_directory: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
         let wd = working_directory.unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
-        // Dummy PTY for now
-        // let pty = PtyManager::new_with_cwd(shell, &wd)?;
+        let pty = PtyManager::new_with_cwd(shell, std::path::PathBuf::from(&wd))?;
         let parser = TerminalParser::new(24, 80);
         Ok(Pane {
-            // pty,
+            pty: Arc::new(TokioMutex::new(pty)),
             parser,
             history: vec![],
             current_block: None,

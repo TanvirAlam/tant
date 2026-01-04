@@ -1,27 +1,24 @@
 // PTY + process management
 // Spawn the user's shell inside a pseudo-terminal
 
-// use portable_pty::{CommandBuilder, PtySize};
-// #[cfg(unix)]
-// use portable_pty::unix::PtySystem as ConcretePtySystem;
-// #[cfg(windows)]
-// use portable_pty::windows::PtySystem as ConcretePtySystem;
-use tokio::io::{AsyncRead, AsyncWrite};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::io::{BufReader, BufWriter, Read, Write};
 
-pub struct _PtyManager {
+pub struct PtyManager {
     master: Box<dyn portable_pty::MasterPty + Send>,
+    #[allow(dead_code)]
     child: Box<dyn portable_pty::Child + Send>,
-    reader: Box<dyn AsyncRead + Send + Unpin>,
-    writer: Box<dyn AsyncWrite + Send + Unpin>,
+    reader: BufReader<Box<dyn Read + Send>>,
+    writer: BufWriter<Box<dyn Write + Send>>,
 }
 
-/*
 impl PtyManager {
     pub fn new(shell: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        #[cfg(unix)]
-        let pty_system = PtySystem::default();
-        #[cfg(windows)]
-        let pty_system = ConcretePtySystem::default();
+        Self::new_with_cwd(shell, std::env::current_dir()?)
+    }
+
+    pub fn new_with_cwd(shell: &str, cwd: std::path::PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows: 24,
             cols: 80,
@@ -29,10 +26,10 @@ impl PtyManager {
             pixel_height: 0,
         })?;
         let mut cmd = CommandBuilder::new(shell);
-        cmd.cwd(std::env::current_dir()?);
+        cmd.cwd(cwd);
         let child = pair.slave.spawn_command(cmd)?;
-        let reader = pair.master.input;
-        let writer = pair.master.output;
+        let reader = BufReader::new(pair.master.try_clone_reader()?);
+        let writer = BufWriter::new(pair.master.take_writer()?);
         Ok(PtyManager {
             master: pair.master,
             child,
@@ -41,12 +38,12 @@ impl PtyManager {
         })
     }
 
-    pub fn reader(&mut self) -> &mut (dyn AsyncRead + Send + Unpin) {
-        &mut *self.reader
+    pub fn reader(&mut self) -> &mut (dyn Read + Send) {
+        &mut self.reader
     }
 
-    pub fn writer(&mut self) -> &mut (dyn AsyncWrite + Send + Unpin) {
-        &mut *self.writer
+    pub fn writer(&mut self) -> &mut (dyn Write + Send) {
+        &mut self.writer
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Box<dyn std::error::Error>> {
@@ -54,4 +51,3 @@ impl PtyManager {
         Ok(())
     }
 }
-*/
