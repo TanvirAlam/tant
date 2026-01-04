@@ -1,4 +1,4 @@
-use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse};
+use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse, clipboard, Point};
 use iced::keyboard::{self, Key, Modifiers};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -115,6 +115,10 @@ pub enum Message {
     TerminalInput(String),
     TerminalSubmit,
     MouseWheel(mouse::ScrollDelta),
+    MouseButtonPressed(mouse::Button),
+    MouseCursorMoved(Point),
+    MouseButtonReleased(mouse::Button),
+    CopySelected,
     None,
 }
 
@@ -127,6 +131,10 @@ struct Tant {
     ai_response: Option<String>,
     scroll_offset: usize,
     follow_mode: bool,
+    selection_start: Option<(usize, usize)>,
+    selection_end: Option<(usize, usize)>,
+    mouse_button_down: bool,
+    last_cursor_pos: Point,
 }
 
 impl Tant {
@@ -232,6 +240,14 @@ impl Tant {
         data
     }
 
+    fn pos_to_cell(&self, pos: Point) -> (usize, usize) {
+        let cell_w = self.renderer.cell_size().0;
+        let cell_h = self.renderer.cell_size().1;
+        let col = (pos.x / cell_w) as usize;
+        let row = (pos.y / cell_h) as usize;
+        (row, col)
+    }
+
     fn call_ai(&self, prompt: &str, action: &str) -> String {
         // Mock AI response
         match action {
@@ -286,7 +302,7 @@ impl Application for Tant {
             api_key: None,
         };
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None, scroll_offset: 0, follow_mode: true },
+            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None, scroll_offset: 0, follow_mode: true, selection_start: None, selection_end: None, mouse_button_down: false, last_cursor_pos: Point { x: 0.0, y: 0.0 } },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -609,6 +625,55 @@ impl Application for Tant {
                 }
                 Command::none()
             }
+            Message::MouseButtonPressed(button) => {
+                if button == mouse::Button::Left {
+                    self.mouse_button_down = true;
+                    let cell = self.pos_to_cell(self.last_cursor_pos);
+                    self.selection_start = Some(cell);
+                    self.selection_end = Some(cell);
+                }
+                Command::none()
+            }
+            Message::MouseCursorMoved(position) => {
+                self.last_cursor_pos = position;
+                if self.mouse_button_down {
+                    let cell = self.pos_to_cell(position);
+                    self.selection_end = Some(cell);
+                }
+                Command::none()
+            }
+            Message::MouseButtonReleased(button) => {
+                if button == mouse::Button::Left {
+                    self.mouse_button_down = false;
+                }
+                Command::none()
+            }
+            Message::CopySelected => {
+                if let (Some(tab), Some(start), Some(end)) = (self.layout.get(self.active_tab), self.selection_start, self.selection_end) {
+                    if let Some(pane) = tab.panes.get(tab.active_pane) {
+                        let contents = pane.parser.screen().contents();
+                        let lines: Vec<&str> = contents.lines().collect();
+                        let mut selected = String::new();
+                        let (start_line, start_col) = start.min(end);
+                        let (end_line, end_col) = start.max(end);
+                        for line_idx in start_line..=end_line {
+                            if let Some(line) = lines.get(line_idx) {
+                                let start_c = if line_idx == start_line { start_col } else { 0 };
+                                let end_c = if line_idx == end_line { end_col } else { line.len() };
+                                if start_c < line.len() {
+                                    let end_c = end_c.min(line.len());
+                                    selected.push_str(&line[start_c..end_c]);
+                                    if line_idx < end_line {
+                                        selected.push('\n');
+                                    }
+                                }
+                            }
+                        }
+                        return clipboard::write(selected);
+                    }
+                }
+                Command::none()
+            }
             Message::PtyData(_) | Message::ParserEvents(_) | Message::None => Command::none(),
         }
     }
@@ -617,14 +682,14 @@ impl Application for Tant {
         const EMPTY_STR: &str = "";
         if let Some(tab) = self.layout.get(self.active_tab) {
             if let Some(pane) = tab.panes.get(tab.active_pane) {
-                self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset)
+                self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset, self.selection_start, self.selection_end)
             } else {
                 let dummy_parser = TerminalParser::new(24, 80);
-                self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset)
+                self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset, self.selection_start, self.selection_end)
             }
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset)
+            self.renderer.view(&[], &None, EMPTY_STR, &self.search_query, dummy_parser.screen(), &self.ai_settings, &self.ai_response, self.scroll_offset, self.selection_start, self.selection_end)
         }
     }
 
@@ -648,6 +713,15 @@ impl Application for Tant {
                 }
                 iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                     Message::MouseWheel(delta)
+                }
+                iced::Event::Mouse(mouse::Event::ButtonPressed(button)) => {
+                    Message::MouseButtonPressed(button)
+                }
+                iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                    Message::MouseCursorMoved(position)
+                }
+                iced::Event::Mouse(mouse::Event::ButtonReleased(button)) => {
+                    Message::MouseButtonReleased(button)
                 }
                 iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
                     eprintln!("Keyboard event - key: {:?}, modifiers: {:?}, text: {:?}", key, modifiers, text);
