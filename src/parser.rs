@@ -2,6 +2,7 @@
 // Use vt100 for parsing
 
 use vt100::Parser;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub enum ParserEvent {
@@ -9,7 +10,7 @@ pub enum ParserEvent {
     Command(String),
     CommandEnd(i32),
     Directory(String),
-    GitBranch(String),
+    GitInfo { branch: String, status: Option<GitStatus> },
     PromptShown,
 }
 
@@ -18,6 +19,14 @@ pub enum ParserEvent {
 const OSC_PROMPT_START: &str = "\x1b]133;A";
 const OSC_COMMAND_START: &str = "\x1b]133;C";
 const OSC_COMMAND_END_PREFIX: &str = "\x1b]133;D";
+const OSC_GIT_INFO_PREFIX: &str = "\x1b]133;G;";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GitStatus {
+    Clean,
+    Dirty,
+    Conflicts,
+}
 
 pub struct TerminalParser {
     parser: Parser,
@@ -94,6 +103,17 @@ impl TerminalParser {
                 }
             }
         }
+
+        if let Some(pos) = buffer_str.rfind(OSC_GIT_INFO_PREFIX) {
+            let rest = &buffer_str[pos + OSC_GIT_INFO_PREFIX.len()..];
+            if let Some(end_pos) = rest.find('\x07').or_else(|| rest.find("\x1b\\")) {
+                let payload = &rest[..end_pos];
+                if let Some((branch, status)) = Self::parse_git_info(payload) {
+                    self.events.push(ParserEvent::GitInfo { branch, status });
+                    eprintln!("[Shell Integration] Git info detected");
+                }
+            }
+        }
         
         // Limit buffer size to prevent unbounded growth
         if self.buffer.len() > 8192 {
@@ -101,6 +121,31 @@ impl TerminalParser {
             let keep_from = self.buffer.len() - 4096;
             self.buffer = self.buffer[keep_from..].to_vec();
         }
+    }
+
+    fn parse_git_info(payload: &str) -> Option<(String, Option<GitStatus>)> {
+        let mut branch: Option<String> = None;
+        let mut status: Option<GitStatus> = None;
+        for part in payload.split(';') {
+            let (key, value) = part.split_once('=')?;
+            match key {
+                "branch" => {
+                    if !value.is_empty() {
+                        branch = Some(value.to_string());
+                    }
+                }
+                "status" => {
+                    status = match value {
+                        "clean" => Some(GitStatus::Clean),
+                        "dirty" => Some(GitStatus::Dirty),
+                        "conflicts" => Some(GitStatus::Conflicts),
+                        _ => None,
+                    };
+                }
+                _ => {}
+            }
+        }
+        branch.map(|branch| (branch, status))
     }
 
     pub fn screen(&self) -> &vt100::Screen {

@@ -21,6 +21,28 @@ function _tant_osc
     printf "\033]133;%s\007" $argv[1]
 end
 
+# Emit git info (branch + status) using OSC 133;G
+function _tant_emit_git_info
+    set -l git_info (git -C . status --porcelain=v2 -b 2>/dev/null)
+    or return 0
+    set -l branch (printf "%s\n" "$git_info" | command awk '/^# branch.head /{print $3; exit}')
+    if test -z "$branch"; or test "$branch" = "(detached)"
+        return 0
+    end
+
+    set -l git_status clean
+    printf "%s\n" "$git_info" | command awk '($1 == "u" || $1 == "?" || $1 == "1" || $1 == "2") {exit 0} END {exit 1}'
+    if test $status -eq 0
+        set git_status dirty
+    end
+    printf "%s\n" "$git_info" | command awk '$1 == "u" {exit 0} END {exit 1}'
+    if test $status -eq 0
+        set git_status conflicts
+    end
+
+    _tant_osc "G;branch=$branch;status=$git_status"
+end
+
 # Pre-execution hook: runs right before command execution
 function _tant_preexec --on-event fish_preexec
     # Emit command start marker
@@ -37,6 +59,7 @@ end
 function _tant_prompt_start --on-event fish_prompt
     # Emit prompt start marker
     _tant_osc "A"
+    _tant_emit_git_info
 end
 
 # Modify fish_prompt to include markers

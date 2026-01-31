@@ -11,7 +11,7 @@ mod pty;
 mod parser;
 mod renderer;
 
-use parser::{TerminalParser, ParserEvent};
+use parser::{TerminalParser, ParserEvent, GitStatus};
 use renderer::{TerminalRenderer, StyleRun};
 use pty::PtyManager;
 
@@ -39,6 +39,7 @@ pub struct Block {
     // Keep output for now, until shared store is implemented
     pub output: String,
     pub git_branch: Option<String>,
+    pub git_status: Option<GitStatus>,
     pub host: String,
     #[serde(default)]
     pub collapsed: bool,
@@ -570,6 +571,7 @@ impl Application for Tant {
                                         tags: vec![],
                                         output: String::new(),
                                         git_branch: None,
+                                        git_status: None,
                                         host: "localhost".to_string(), // TODO: get actual host
                                         collapsed: false,
                                     });
@@ -586,9 +588,10 @@ impl Application for Tant {
                                         pane.working_directory = dir;
                                     }
                                 }
-                                ParserEvent::GitBranch(branch) => {
+                                ParserEvent::GitInfo { branch, status } => {
                                     if let Some(ref mut block) = pane.current_block {
                                         block.git_branch = Some(branch);
+                                        block.git_status = status;
                                     }
                                 }
                                 ParserEvent::CommandEnd(status) => {

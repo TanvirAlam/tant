@@ -167,7 +167,6 @@ impl TerminalRenderer {
                 row_hashes: row_hashes.clone(),
                 tab_id,
                 pane_id,
-                theme_config: theme_config.clone(),
             })
             .width(Length::Fill)
             .height(Length::Fill)
@@ -239,12 +238,13 @@ impl TerminalRenderer {
         let block_for_metadata = current.as_ref().or_else(|| history.last());
         
         // Get metadata from block or use fallbacks
-        let (cwd_str, git_branch, host) = if let Some(block) = block_for_metadata {
+        let (cwd_str, git_branch, git_status, host) = if let Some(block) = block_for_metadata {
             (
                 block.cwd.as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "~".to_string()),
                 block.git_branch.clone(),
+                block.git_status.clone(),
                 block.host.clone(),
             )
         } else {
@@ -253,6 +253,7 @@ impl TerminalRenderer {
                 std::env::current_dir()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| "~".to_string()),
+                None,
                 None,
                 "localhost".to_string(),
             )
@@ -267,11 +268,33 @@ impl TerminalRenderer {
         
         // Git branch label (if available)
         if let Some(branch) = git_branch {
+            let branch_color = match branch.as_str() {
+                "main" | "master" => Color::from_rgb(0.2, 0.75, 0.45),
+                _ => Color::from_rgb(0.55, 0.65, 0.95),
+            };
+            let status_indicator = match git_status {
+                Some(crate::parser::GitStatus::Clean) => "✔",
+                Some(crate::parser::GitStatus::Dirty) => "●",
+                Some(crate::parser::GitStatus::Conflicts) => "✖",
+                None => "",
+            };
+            let status_color = match git_status {
+                Some(crate::parser::GitStatus::Clean) => Color::from_rgb(0.2, 0.75, 0.45),
+                Some(crate::parser::GitStatus::Dirty) => Color::from_rgb(0.9, 0.55, 0.2),
+                Some(crate::parser::GitStatus::Conflicts) => Color::from_rgb(0.9, 0.35, 0.35),
+                None => Color::from_rgb(0.65, 0.65, 0.65),
+            };
             let branch_label = Row::new()
                 .push(Text::new("🌿 ").size(10.0))
-                .push(Text::new(branch).size(10.0).font(Font::MONOSPACE))
+                .push(Text::new(branch).size(10.0).font(Font::MONOSPACE).style(branch_color))
                 .spacing(3);
-            metadata_row = metadata_row.push(branch_label);
+            let branch_with_status = if status_indicator.is_empty() {
+                branch_label
+            } else {
+                branch_label
+                    .push(Text::new(format!(" {}", status_indicator)).size(10.0).style(status_color))
+            };
+            metadata_row = metadata_row.push(branch_with_status);
         }
         
         // Host label
@@ -504,7 +527,6 @@ pub struct TerminalCanvas {
     pub row_hashes: Arc<Mutex<HashMap<(usize, usize, u16), u64>>>,
     pub tab_id: usize,
     pub pane_id: usize,
-    pub theme_config: ThemeConfig,
 }
 
 impl Program<Message> for TerminalCanvas {

@@ -22,6 +22,28 @@ _tant_osc() {
     printf "\033]133;%s\007" "$1"
 }
 
+# Emit git info (branch + status) using OSC 133;G
+_tant_emit_git_info() {
+    local git_info
+    local git_status
+    local branch
+    git_info=$(git -C . status --porcelain=v2 -b 2>/dev/null) || return 0
+    branch=$(printf "%s\n" "$git_info" | command awk '/^# branch.head /{print $3; exit}')
+    [[ -z "$branch" || "$branch" == "(detached)" ]] && return 0
+
+    if printf "%s\n" "$git_info" | command awk '($1 == "u" || $1 == "?" || $1 == "1" || $1 == "2") {exit 0} END {exit 1}'; then
+        git_status="dirty"
+    else
+        git_status="clean"
+    fi
+
+    if printf "%s\n" "$git_info" | command awk '$1 == "u" {exit 0} END {exit 1}'; then
+        git_status="conflicts"
+    fi
+
+    _tant_osc "G;branch=${branch};status=${git_status}"
+}
+
 # Pre-command hook: emitted before command execution
 _tant_preexec() {
     # Emit command start marker
@@ -37,6 +59,9 @@ _tant_precmd() {
     
     # Emit prompt start marker
     _tant_osc "A"
+
+    # Emit git info after prompt start (updates on directory change)
+    _tant_emit_git_info
 }
 
 # Post-prompt hook: emitted after prompt is displayed, before reading command
