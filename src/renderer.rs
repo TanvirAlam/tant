@@ -87,6 +87,47 @@ fn draw_runs(frame: &mut Frame, runs: &[StyleRun], y: f32, cell_height: f32) {
 
 pub struct TerminalRenderer;
 
+#[derive(Debug, Clone, Copy)]
+struct MatchRanges {
+    command: bool,
+    output: bool,
+}
+
+fn normalize_query(query: &str) -> String {
+    query.trim().to_lowercase()
+}
+
+fn block_matches_query(block: &Block, query: &str) -> MatchRanges {
+    if query.is_empty() {
+        return MatchRanges { command: false, output: false };
+    }
+    let q = normalize_query(query);
+    let cmd_match = block.command.to_lowercase().contains(&q);
+    let out_match = block.output.to_lowercase().contains(&q);
+    MatchRanges { command: cmd_match, output: out_match }
+}
+
+fn matches_filters(block: &Block, query: &str, success_only: bool, failure_only: bool, pinned_only: bool) -> Option<MatchRanges> {
+    if pinned_only && !block.pinned {
+        return None;
+    }
+    if success_only && block.exit_code != Some(0) {
+        return None;
+    }
+    if failure_only && matches!(block.exit_code, Some(0) | None) {
+        return None;
+    }
+    if query.is_empty() {
+        return Some(MatchRanges { command: false, output: false });
+    }
+    let ranges = block_matches_query(block, query);
+    if ranges.command || ranges.output {
+        Some(ranges)
+    } else {
+        None
+    }
+}
+
 fn screen_to_text(screen: &vt100::Screen) -> String {
     let size = screen.size();
     let cols = size.0 as usize;
@@ -156,7 +197,7 @@ impl TerminalRenderer {
         (8.0, theme_config.line_height * theme_config.font_size)
     }
 
-    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, _search_query: &str, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
+    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
         // Use raw terminal mode for TUI apps (vim, top, etc.), block mode for normal shell
         if alt_screen_active {
             Canvas::new(TerminalCanvas {
@@ -172,12 +213,56 @@ impl TerminalRenderer {
             .height(Length::Fill)
             .into()
         } else {
-            self.render_blocks(history, current, current_command, screen, theme_config)
+            self.render_blocks(history, current, current_command, search_query, search_success_only, search_failure_only, search_pinned_only, search_input_id, screen, theme_config)
         }
     }
 
-    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, screen: &vt100::Screen, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
+    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
         let mut column = Column::new().spacing(10).padding(theme_config.padding as u16);
+
+        let mut match_count = 0usize;
+        let mut filtered_blocks: Vec<(usize, &Block, MatchRanges)> = vec![];
+        for (index, block) in history.iter().enumerate() {
+            if let Some(ranges) = matches_filters(block, search_query, search_success_only, search_failure_only, search_pinned_only) {
+                if !search_query.trim().is_empty() {
+                    if ranges.command { match_count += 1; }
+                    if ranges.output { match_count += 1; }
+                }
+                filtered_blocks.push((index, block, ranges));
+            }
+        }
+
+        let search_input = TextInput::new("Search commands/output...", search_query)
+            .id(search_input_id)
+            .on_input(Message::UpdateSearch)
+            .size(12.0)
+            .padding(6)
+            .font(Font::MONOSPACE);
+
+        let search_badge = Text::new(format!("Matches: {}", match_count))
+            .size(11.0)
+            .style(Color::from_rgb(0.7, 0.7, 0.7));
+
+        let success_filter = Button::new(Text::new("Success").size(11.0))
+            .on_press(Message::ToggleSearchSuccess);
+        let failure_filter = Button::new(Text::new("Failure").size(11.0))
+            .on_press(Message::ToggleSearchFailure);
+        let pinned_filter = Button::new(Text::new("Pinned").size(11.0))
+            .on_press(Message::ToggleSearchPinned);
+        let clear_filter = Button::new(Text::new("Clear").size(11.0))
+            .on_press(Message::ClearSearch);
+
+        let search_row = Row::new()
+            .push(Container::new(search_input).width(Length::Fill))
+            .push(search_badge)
+            .push(success_filter)
+            .push(failure_filter)
+            .push(pinned_filter)
+            .push(clear_filter)
+            .spacing(8)
+            .align_items(Alignment::Center);
+
+        column = column.push(search_row);
 
         // Show live screen text if no history yet (so prompts are visible)
         if history.is_empty() && current.is_none() {
@@ -195,8 +280,8 @@ impl TerminalRenderer {
         }
 
         // Render history blocks
-        for (index, block) in history.iter().enumerate() {
-            let block_widget = self.render_block(block, index, theme_config);
+        for (index, block, ranges) in filtered_blocks {
+            let block_widget = self.render_block(block, index, theme_config, search_query, ranges);
             column = column.push(block_widget);
         }
 
@@ -331,7 +416,7 @@ impl TerminalRenderer {
             .into()
     }
 
-    fn render_block<'a>(&self, block: &'a Block, index: usize, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
+    fn render_block<'a>(&self, block: &'a Block, index: usize, theme_config: &'a ThemeConfig, search_query: &'a str, ranges: MatchRanges) -> Element<'a, Message> {
         let (status_display, status_color) = match block.exit_code {
             Some(0) => ("Success".to_string(), Color::from_rgb(0.25, 0.8, 0.4)),
             Some(code) => (format!("Exit {}", code), Color::from_rgb(0.9, 0.35, 0.35)),
@@ -348,9 +433,15 @@ impl TerminalRenderer {
             .size(theme_config.font_size + 2.0)
             .style(Color::from_rgb(0.6, 0.8, 1.0));
 
+        let command_color = if ranges.command && !search_query.trim().is_empty() {
+            Color::from_rgb(1.0, 0.85, 0.4)
+        } else {
+            Color::WHITE
+        };
         let command = Text::new(&block.command)
             .font(Font::MONOSPACE)
-            .size(theme_config.font_size);
+            .size(theme_config.font_size)
+            .style(command_color);
 
         let status = Container::new(
             Text::new(status_display)
@@ -402,9 +493,15 @@ impl TerminalRenderer {
             .padding([10, 12]);
 
         if !block.collapsed && !block.output.is_empty() {
+            let output_color = if ranges.output && !search_query.trim().is_empty() {
+                Color::from_rgb(1.0, 0.9, 0.55)
+            } else {
+                Color::from_rgb(0.85, 0.85, 0.85)
+            };
             let output_text = Text::new(&block.output)
                 .font(Font::MONOSPACE)
-                .size(theme_config.font_size - 3.0);
+                .size(theme_config.font_size - 3.0)
+                .style(output_color);
             let output_container = Container::new(output_text)
                 .padding(8)
                 .style(|_theme: &Theme| container::Appearance {

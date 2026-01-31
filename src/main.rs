@@ -1,6 +1,6 @@
 use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse, clipboard, Point, Length, Color};
 use iced::keyboard::{self, Key, Modifiers};
-use iced::widget::{Row, Column, container, TextInput};
+use iced::widget::{Row, Column, container, TextInput, text_input};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
 use chrono::{DateTime, Utc};
@@ -178,6 +178,11 @@ pub enum Message {
     UpdateCurrent(String),
     RunCurrent,
     UpdateSearch(String),
+    FocusSearch,
+    ToggleSearchSuccess,
+    ToggleSearchFailure,
+    ToggleSearchPinned,
+    ClearSearch,
     TogglePin(usize),
     SaveSession,
     AiExplainError,
@@ -212,6 +217,10 @@ struct Tant {
     active_tab: usize,
     renderer: TerminalRenderer,
     search_query: String,
+    search_success_only: bool,
+    search_failure_only: bool,
+    search_pinned_only: bool,
+    search_input_id: text_input::Id,
     ai_settings: AiSettings,
     ai_response: Option<String>,
     show_command_palette: bool,
@@ -562,7 +571,7 @@ impl Application for Tant {
             colors: HashMap::new(), // Will add defaults later
         };
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info() },
+            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info() },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -795,6 +804,29 @@ impl Application for Tant {
             }
             Message::UpdateSearch(query) => {
                 self.search_query = query;
+                Command::none()
+            }
+            Message::FocusSearch => text_input::focus(self.search_input_id.clone()),
+            Message::ToggleSearchSuccess => {
+                self.search_success_only = !self.search_success_only;
+                if self.search_success_only {
+                    self.search_failure_only = false;
+                }
+                Command::none()
+            }
+            Message::ToggleSearchFailure => {
+                self.search_failure_only = !self.search_failure_only;
+                if self.search_failure_only {
+                    self.search_success_only = false;
+                }
+                Command::none()
+            }
+            Message::ToggleSearchPinned => {
+                self.search_pinned_only = !self.search_pinned_only;
+                Command::none()
+            }
+            Message::ClearSearch => {
+                self.search_query.clear();
                 Command::none()
             }
             Message::TogglePin(index) => {
@@ -1044,7 +1076,7 @@ impl Application for Tant {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config)
+            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config)
         };
 
         if self.show_command_palette {
@@ -1103,6 +1135,14 @@ impl Application for Tant {
                         return Message::OpenCommandPalette;
                     }
 
+                    if (modifiers.command() || modifiers.control()) && matches!(key, iced::keyboard::Key::Character(ref c) if c == "f") {
+                        return Message::FocusSearch;
+                    }
+
+                    if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
+                        return Message::ClearSearch;
+                    }
+
                     // Handle special keys and modifiers first
                     if modifiers.control() || modifiers.alt() || modifiers.logo() {
                         eprintln!("Sending as KeyPress (with modifiers)");
@@ -1145,10 +1185,10 @@ impl Tant {
         match node {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
-                    self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config)
+                    self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config)
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
-                    self.renderer.view(&[], &None, "", &self.search_query, dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config)
+                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config)
                 }
             }
             LayoutNode::Split { axis, ratio, left, right } => {
