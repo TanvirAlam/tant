@@ -87,6 +87,26 @@ fn draw_runs(frame: &mut Frame, runs: &[StyleRun], y: f32, cell_height: f32) {
 
 pub struct TerminalRenderer;
 
+fn screen_to_text(screen: &vt100::Screen) -> String {
+    let size = screen.size();
+    let cols = size.0 as usize;
+    let rows = size.1 as usize;
+    let mut out = String::new();
+    for row in 0..rows {
+        let mut line = String::new();
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row as u16, col as u16) {
+                line.push_str(&cell.contents());
+            }
+        }
+        out.push_str(line.trim_end());
+        if row + 1 < rows {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn color_to_iced(color: vt100::Color) -> Color {
     match color {
         vt100::Color::Rgb(r, g, b) => Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
@@ -153,18 +173,26 @@ impl TerminalRenderer {
             .height(Length::Fill)
             .into()
         } else {
-            self.render_blocks(history, current, current_command, theme_config)
+            self.render_blocks(history, current, current_command, screen, theme_config)
         }
     }
 
-    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
+    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, screen: &vt100::Screen, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
         let mut column = Column::new().spacing(5).padding(theme_config.padding as u16);
 
-        // Show welcome message if no history
+        // Show live screen text if no history yet (so prompts are visible)
         if history.is_empty() && current.is_none() {
-            let welcome = Text::new("Welcome to Tant Terminal\n\nType a command below and press Enter to get started.")
-                .size(14.0);
-            column = column.push(welcome);
+            let screen_text = screen_to_text(screen);
+            if screen_text.trim().is_empty() {
+                let welcome = Text::new("Welcome to Tant Terminal\n\nType a command below and press Enter to get started.")
+                    .size(14.0);
+                column = column.push(welcome);
+            } else {
+                let live_output = Text::new(screen_text)
+                    .font(Font::MONOSPACE)
+                    .size(theme_config.font_size - 2.0);
+                column = column.push(live_output);
+            }
         }
 
         // Render history blocks
