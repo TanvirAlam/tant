@@ -477,6 +477,7 @@ impl TerminalRenderer {
 
         let buttons = Row::new()
             .push(Button::new(Text::new("Copy").size(11.0)).on_press(Message::CopyCommand(index)))
+            .push(Button::new(Text::new("Copy Output").size(11.0)).on_press(Message::CopyOutput(index)))
             .push(Button::new(Text::new("Rerun").size(11.0)).on_press(Message::RerunCommand(index)))
             .push(Button::new(Text::new(if block.collapsed { "Show" } else { "Hide" }).size(11.0)).on_press(Message::ToggleCollapsed(index)))
             .push(Button::new(Text::new(if block.pinned { "📌" } else { "Pin" }).size(11.0)).on_press(Message::TogglePin(index)))

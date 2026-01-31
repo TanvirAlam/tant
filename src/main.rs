@@ -174,6 +174,7 @@ pub enum Message {
     UpdateCommand(usize, String),
     RerunCommand(usize),
     CopyCommand(usize),
+    CopyOutput(usize),
     ToggleCollapsed(usize),
     UpdateCurrent(String),
     RunCurrent,
@@ -768,6 +769,16 @@ impl Application for Tant {
                     if let Some(pane) = tab.panes.get(tab.active_pane) {
                         if let Some(block) = pane.history.get(index) {
                             return clipboard::write(block.command.clone());
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::CopyOutput(index) => {
+                if let Some(tab) = self.layout.get(self.active_tab) {
+                    if let Some(pane) = tab.panes.get(tab.active_pane) {
+                        if let Some(block) = pane.history.get(index) {
+                            return clipboard::write(block.output.clone());
                         }
                     }
                 }
