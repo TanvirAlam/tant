@@ -68,23 +68,23 @@ impl TerminalParser {
         // Check for alt screen sequences
         if buffer_str.contains("\x1b[?1049h") {
             self.alt_screen_active = true;
-            eprintln!("[Alt Screen] Entered alt screen mode");
+            log::debug!("[Alt Screen] Entered alt screen mode");
         }
         if buffer_str.contains("\x1b[?1049l") {
             self.alt_screen_active = false;
-            eprintln!("[Alt Screen] Exited alt screen mode");
+            log::debug!("[Alt Screen] Exited alt screen mode");
         }
         
         // Check for OSC 133 sequences
         if buffer_str.contains(OSC_PROMPT_START) {
             self.events.push(ParserEvent::PromptShown);
-            eprintln!("[Shell Integration] Prompt shown");
+            log::debug!("[Shell Integration] Prompt shown");
         }
         
         if buffer_str.contains(OSC_COMMAND_START) {
             self.events.push(ParserEvent::CommandStart);
             self.in_command = true;
-            eprintln!("[Shell Integration] Command started");
+            log::debug!("[Shell Integration] Command started");
         }
         
         // Check for command end with exit code
@@ -98,7 +98,7 @@ impl TerminalParser {
                     if let Ok(exit_code) = exit_code_str.trim().parse::<i32>() {
                         self.events.push(ParserEvent::CommandEnd(exit_code));
                         self.in_command = false;
-                        eprintln!("[Shell Integration] Command ended with exit code: {}", exit_code);
+                        log::debug!("[Shell Integration] Command ended with exit code: {}", exit_code);
                     }
                 }
             }
@@ -110,7 +110,7 @@ impl TerminalParser {
                 let payload = &rest[..end_pos];
                 if let Some((branch, status)) = Self::parse_git_info(payload) {
                     self.events.push(ParserEvent::GitInfo { branch, status });
-                    eprintln!("[Shell Integration] Git info detected");
+                    log::debug!("[Shell Integration] Git info detected");
                 }
             }
         }

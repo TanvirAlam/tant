@@ -1,6 +1,7 @@
 use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse, clipboard, Point, Length, Color};
 use iced::keyboard::{self, Key, Modifiers};
 use iced::widget::{Row, Column, container, TextInput, text_input};
+use log::{debug, info, warn, error};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
 use chrono::{DateTime, Utc};
@@ -421,15 +422,15 @@ impl Tant {
         match action {
             PaletteAction::SplitPaneHorizontal => {
                 // TODO: Implement split pane
-                eprintln!("Split pane horizontal");
+                warn!("Split pane horizontal is not implemented yet");
             }
             PaletteAction::SplitPaneVertical => {
                 // TODO: Implement split pane
-                eprintln!("Split pane vertical");
+                warn!("Split pane vertical is not implemented yet");
             }
             PaletteAction::ClosePane => {
                 // TODO: Implement close pane
-                eprintln!("Close pane");
+                warn!("Close pane is not implemented yet");
             }
             PaletteAction::SwitchTab(index) => {
                 if index < self.layout.len() {
@@ -443,7 +444,7 @@ impl Tant {
                             if block.pinned {
                                 let _cmd = format!("{}\n", block.command);
                                 // TODO: Send to current pane
-                                eprintln!("Run pinned command: {}", block.command);
+                                info!("Run pinned command: {}", block.command);
                             }
                         }
                     }
@@ -454,12 +455,12 @@ impl Tant {
             }
             PaletteAction::ExportTheme => {
                 if let Err(e) = self.export_theme() {
-                    eprintln!("Failed to export theme: {}", e);
+                    error!("Failed to export theme: {}", e);
                 }
             }
             PaletteAction::ImportTheme => {
                 if let Err(e) = self.import_theme() {
-                    eprintln!("Failed to import theme: {}", e);
+                    error!("Failed to import theme: {}", e);
                 }
             }
         }
@@ -600,7 +601,6 @@ impl Application for Tant {
                     for pane in &mut tab.panes {
                         // Receive data from the async reader
                         while let Ok(data) = pane.data_receiver.try_recv() {
-                            eprintln!("Received {} bytes from PTY", data.len());
                             pane.parser.process(&data);
                             has_new_data = true;
                         }
@@ -611,7 +611,7 @@ impl Application for Tant {
                                 ParserEvent::PromptShown => {
                                     // Prompt is being shown - this happens before user input
                                     // We can use this to prepare for the next command
-                                    eprintln!("[Block Detection] Prompt shown");
+                                    debug!("[Block Detection] Prompt shown");
                                 }
                                 ParserEvent::CommandStart => {
                                     if let Some(mut block) = pane.current_block.take() {
@@ -643,7 +643,7 @@ impl Application for Tant {
                                         is_remote: self.host_info.is_remote,
                                         collapsed: false,
                                     });
-                                    eprintln!("[Block Detection] Command started - new block created");
+                                    debug!("[Block Detection] Command started - new block created");
                                 }
                                 ParserEvent::Command(cmd) => {
                                     if let Some(ref mut block) = pane.current_block {
@@ -672,7 +672,7 @@ impl Application for Tant {
                                         // Capture output - this gets the visible screen at command end
                                         block.output = pane.parser.screen_text();
                                         pane.history.push(block);
-                                        eprintln!("[Block Detection] Command ended with status {} - block saved", status);
+                                        debug!("[Block Detection] Command ended with status {} - block saved", status);
                                     }
                                 }
                             }
@@ -692,15 +692,17 @@ impl Application for Tant {
                 Command::none()
             }
             Message::KeyPress(key, modifiers) => {
-                eprintln!("KeyPress received: {:?} with modifiers: {:?}", key, modifiers);
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         if let Ok(mut pty) = pane.pty.try_lock() {
                             let bytes = Self::key_to_bytes(&key, &modifiers);
-                            eprintln!("Sending bytes: {:?}", bytes);
                             if !bytes.is_empty() {
-                                pty.writer().write_all(&bytes).ok();
-                                pty.writer().flush().ok();
+                                if let Err(err) = pty.writer().write_all(&bytes) {
+                                    error!("Failed to write to PTY: {}", err);
+                                }
+                                if let Err(err) = pty.writer().flush() {
+                                    error!("Failed to flush PTY writer: {}", err);
+                                }
                             }
                         }
                     }
@@ -708,12 +710,15 @@ impl Application for Tant {
                 Command::none()
             }
             Message::TextInput(text) => {
-                eprintln!("TextInput received: {:?}", text);
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         if let Ok(mut pty) = pane.pty.try_lock() {
-                            pty.writer().write_all(text.as_bytes()).ok();
-                            pty.writer().flush().ok();
+                            if let Err(err) = pty.writer().write_all(text.as_bytes()) {
+                                error!("Failed to write to PTY: {}", err);
+                            }
+                            if let Err(err) = pty.writer().flush() {
+                                error!("Failed to flush PTY writer: {}", err);
+                            }
                         }
                     }
                 }
@@ -724,10 +729,18 @@ impl Application for Tant {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         if let Ok(mut pty) = pane.pty.try_lock() {
                             // Bracketed paste mode
-                            pty.writer().write_all(b"\x1b[200~").ok();
-                            pty.writer().write_all(text.as_bytes()).ok();
-                            pty.writer().write_all(b"\x1b[201~").ok();
-                            pty.writer().flush().ok();
+                            if let Err(err) = pty.writer().write_all(b"\x1b[200~") {
+                                error!("Failed to write to PTY: {}", err);
+                            }
+                            if let Err(err) = pty.writer().write_all(text.as_bytes()) {
+                                error!("Failed to write to PTY: {}", err);
+                            }
+                            if let Err(err) = pty.writer().write_all(b"\x1b[201~") {
+                                error!("Failed to write to PTY: {}", err);
+                            }
+                            if let Err(err) = pty.writer().flush() {
+                                error!("Failed to flush PTY writer: {}", err);
+                            }
                         }
                     }
                 }
@@ -743,7 +756,9 @@ impl Application for Tant {
                     for pane in &mut tab.panes {
                         pane.parser.resize(rows, cols);
                         if let Ok(mut pty) = pane.pty.try_lock() {
-                            pty.resize(rows, cols, pixel_width, pixel_height).ok();
+                            if let Err(err) = pty.resize(rows, cols, pixel_width, pixel_height) {
+                                error!("Failed to resize PTY: {}", err);
+                            }
                         }
                     }
                 }
@@ -987,11 +1002,11 @@ impl Application for Tant {
             }
             Message::UpdateAiSettings(_) => Command::none(),
             Message::WindowFocused => {
-                eprintln!("Window focused!");
+                debug!("Window focused");
                 Command::none()
             }
             Message::WindowUnfocused => {
-                eprintln!("Window unfocused!");
+                debug!("Window unfocused");
                 Command::none()
             }
             Message::TerminalInput(input) => {
@@ -1009,8 +1024,12 @@ impl Application for Tant {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         if let Ok(mut pty) = pane.pty.try_lock() {
                             let cmd = format!("{}\r", pane.current_command);
-                            pty.writer().write_all(cmd.as_bytes()).ok();
-                            pty.writer().flush().ok();
+                            if let Err(err) = pty.writer().write_all(cmd.as_bytes()) {
+                                error!("Failed to write to PTY: {}", err);
+                            }
+                            if let Err(err) = pty.writer().flush() {
+                                error!("Failed to flush PTY writer: {}", err);
+                            }
                             pane.current_command.clear();
                         }
                     }
@@ -1162,13 +1181,13 @@ impl Application for Tant {
             }
             Message::ExportTheme => {
                 if let Err(e) = self.export_theme() {
-                    eprintln!("Failed to export theme: {}", e);
+                    error!("Failed to export theme: {}", e);
                 }
                 Command::none()
             }
             Message::ImportTheme => {
                 if let Err(e) = self.import_theme() {
-                    eprintln!("Failed to import theme: {}", e);
+                    error!("Failed to import theme: {}", e);
                 }
                 Command::none()
             }
@@ -1208,7 +1227,6 @@ impl Application for Tant {
     fn subscription(&self) -> Subscription<Message> {
         let time_sub = time::every(std::time::Duration::from_millis(10)).map(|_| Message::Tick);
         let event_sub = iced::event::listen().map(|event| {
-            eprintln!("Event received: {:?}", event);
             match event {
                 iced::Event::Window(_, window::Event::Resized { width, height }) => {
                     Message::Resize(width, height)
@@ -1232,9 +1250,6 @@ impl Application for Tant {
                     Message::MouseButtonReleased(button)
                 }
                 iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
-                    eprintln!("Keyboard event - key: {:?}, modifiers: {:?}, text: {:?}", key, modifiers, text);
-
-
                     // Check for command palette shortcut (Ctrl+K)
                     if modifiers.control() && matches!(key, iced::keyboard::Key::Character(ref c) if c == "k") {
                         return Message::OpenCommandPalette;
@@ -1250,32 +1265,27 @@ impl Application for Tant {
 
                     // Handle special keys and modifiers first
                     if modifiers.control() || modifiers.alt() || modifiers.logo() {
-                        eprintln!("Sending as KeyPress (with modifiers)");
                         return Message::KeyPress(key.clone(), modifiers);
                     }
 
                     // Check if it's a named key (arrows, enter, etc.) but NOT Space
                     if matches!(key, iced::keyboard::Key::Named(_)) {
-                        eprintln!("Sending as KeyPress (named key)");
                         return Message::KeyPress(key.clone(), modifiers);
                     }
 
                     // For regular characters (including space), prefer text field if available
                     if let Some(txt) = text {
                         if !txt.is_empty() {
-                            eprintln!("Sending as TextInput: {:?}", txt);
                             return Message::TextInput(txt.to_string());
                         }
                     }
 
                     // Special handling for space if text is empty
                     if matches!(&key, iced::keyboard::Key::Character(c) if c == " ") {
-                        eprintln!("Sending space character");
                         return Message::TextInput(" ".to_string());
                     }
 
                     // Fallback to key press
-                    eprintln!("Sending as KeyPress (fallback) for key: {:?}", key);
                     Message::KeyPress(key.clone(), modifiers)
                 }
                 _ => Message::None,
@@ -1321,6 +1331,15 @@ impl Tant {
 }
 
 fn main() -> iced::Result {
+    let args: Vec<String> = std::env::args().collect();
+    let mut log_builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    );
+    if args.iter().any(|arg| arg == "--verbose") {
+        log_builder.filter_level(log::LevelFilter::Debug);
+    }
+    log_builder.init();
+
     Tant::run(Settings {
         window: window::Settings {
             size: iced::Size::new(1024.0, 768.0),

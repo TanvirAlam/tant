@@ -673,9 +673,6 @@ impl Program<Message> for TerminalCanvas {
 
         let size = self.screen.size();
         let rows = size.1 as usize;
-        let cols = size.0 as usize;
-
-        eprintln!("Canvas bounds: {:?}, Screen size: {}x{}", bounds, cols, rows);
 
         let mut cache = self.render_cache.lock().unwrap();
         let mut hashes = self.row_hashes.lock().unwrap();
