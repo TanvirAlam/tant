@@ -178,7 +178,7 @@ impl TerminalRenderer {
     }
 
     fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, screen: &vt100::Screen, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
-        let mut column = Column::new().spacing(5).padding(theme_config.padding as u16);
+        let mut column = Column::new().spacing(10).padding(theme_config.padding as u16);
 
         // Show live screen text if no history yet (so prompts are visible)
         if history.is_empty() && current.is_none() {
@@ -203,7 +203,7 @@ impl TerminalRenderer {
 
         // Render current block if running
         if let Some(block) = current {
-            let current_block_widget = self.render_current_block(block, theme_config);
+            let current_block_widget = self.render_current_block(block, screen, theme_config);
             column = column.push(current_block_widget);
         }
 
@@ -301,41 +301,55 @@ impl TerminalRenderer {
     }
 
     fn render_block<'a>(&self, block: &'a Block, index: usize, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
-        let (status_symbol, status_detail, _status_color) = match block.exit_code {
-            Some(0) => ("✓".to_string(), String::new(), Color::from_rgb(0.2, 0.8, 0.2)),
-            Some(code) => ("✗".to_string(), format!(" {}", code), Color::from_rgb(0.9, 0.3, 0.3)),
-            None => ("⋯".to_string(), String::new(), Color::from_rgb(0.6, 0.6, 0.6)),
+        let (status_display, status_color) = match block.exit_code {
+            Some(0) => ("Success".to_string(), Color::from_rgb(0.25, 0.8, 0.4)),
+            Some(code) => (format!("Exit {}", code), Color::from_rgb(0.9, 0.35, 0.35)),
+            None => ("Running".to_string(), Color::from_rgb(0.6, 0.6, 0.6)),
         };
-        let status_display = format!("{}{}", status_symbol, status_detail);
 
         let duration_text = block.duration_ms
             .map(|ms| format!("{:.2}s", ms as f64 / 1000.0))
             .unwrap_or_else(|| "...".to_string());
 
         // Command line with prompt symbol
-        let prompt = Text::new("❯ ")
+        let prompt = Text::new("❯")
             .font(Font::MONOSPACE)
-            .size(theme_config.font_size);
+            .size(theme_config.font_size + 2.0)
+            .style(Color::from_rgb(0.6, 0.8, 1.0));
 
         let command = Text::new(&block.command)
             .font(Font::MONOSPACE)
             .size(theme_config.font_size);
 
-        let status = Text::new(status_display)
-            .size(12.0);
+        let status = Container::new(
+            Text::new(status_display)
+                .size(11.0)
+                .style(Color::WHITE),
+        )
+        .padding([2, 8])
+        .style(move |_theme: &Theme| container::Appearance {
+            background: Some(Background::Color(status_color)),
+            border: Border {
+                radius: 12.0.into(),
+                width: 0.0,
+                color: Color::TRANSPARENT,
+            },
+            ..Default::default()
+        });
 
         let duration = Text::new(duration_text)
-            .size(11.0);
+            .size(11.0)
+            .style(Color::from_rgb(0.75, 0.75, 0.75));
 
         let header = Row::new()
             .push(prompt)
             .push(command)
-            .push(Container::new(Row::new()
-                .push(status)
-                .push(Text::new(" "))
-                .push(duration)
-                .spacing(5))
-                .width(Length::Shrink))
+            .spacing(8)
+            .align_items(Alignment::Center);
+
+        let meta_row = Row::new()
+            .push(status)
+            .push(duration)
             .spacing(8)
             .align_items(Alignment::Center);
 
@@ -344,83 +358,140 @@ impl TerminalRenderer {
             .push(Button::new(Text::new("Rerun").size(11.0)).on_press(Message::RerunCommand(index)))
             .push(Button::new(Text::new(if block.collapsed { "Show" } else { "Hide" }).size(11.0)).on_press(Message::ToggleCollapsed(index)))
             .push(Button::new(Text::new(if block.pinned { "📌" } else { "Pin" }).size(11.0)).on_press(Message::TogglePin(index)))
-            .spacing(5);
-
-        let header_row = Row::new()
-            .push(Container::new(header).width(Length::Fill))
-            .push(buttons)
-            .align_items(Alignment::Center)
-            .spacing(10);
+            .spacing(6);
 
         let mut column = Column::new()
-            .push(header_row)
-            .spacing(8)
-            .padding(12);
+            .push(Row::new()
+                .push(Container::new(header).width(Length::Fill))
+                .push(buttons)
+                .align_items(Alignment::Center)
+                .spacing(10))
+            .push(meta_row)
+            .spacing(6)
+            .padding([10, 12]);
 
         if !block.collapsed && !block.output.is_empty() {
             let output_text = Text::new(&block.output)
                 .font(Font::MONOSPACE)
                 .size(theme_config.font_size - 3.0);
             let output_container = Container::new(output_text)
-                .padding(8);
+                .padding(8)
+                .style(|_theme: &Theme| container::Appearance {
+                    background: Some(Background::Color(Color::from_rgb(0.18, 0.18, 0.18))),
+                    border: Border {
+                        radius: 6.0.into(),
+                        width: 1.0,
+                        color: Color::from_rgb(0.25, 0.25, 0.25),
+                    },
+                    ..Default::default()
+                });
             column = column.push(output_container);
         }
 
         Container::new(column)
             .width(Length::Fill)
-            .padding(10)
+            .padding(6)
+            .style(|_theme: &Theme| container::Appearance {
+                background: Some(Background::Color(Color::from_rgb(0.13, 0.13, 0.13))),
+                border: Border {
+                    radius: 10.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.2, 0.2, 0.2),
+                },
+                ..Default::default()
+            })
             .into()
     }
 
-    fn render_current_block<'a>(&self, block: &'a Block, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
+    fn render_current_block<'a>(&self, block: &'a Block, screen: &vt100::Screen, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
         let duration_text = block.started_at
             .map(|start| format!("{:.2}s", (Utc::now() - start).num_milliseconds() as f64 / 1000.0))
             .unwrap_or_else(|| "...".to_string());
 
         // Command line with prompt symbol
-        let prompt = Text::new("❯ ")
+        let prompt = Text::new("❯")
             .font(Font::MONOSPACE)
-            .size(theme_config.font_size);
+            .size(theme_config.font_size + 2.0)
+            .style(Color::from_rgb(0.6, 0.8, 1.0));
 
         let command = Text::new(&block.command)
             .font(Font::MONOSPACE)
             .size(theme_config.font_size);
 
-        let status = Text::new("⏳")
-            .size(12.0);
+        let status = Container::new(
+            Text::new("Running")
+                .size(11.0)
+                .style(Color::WHITE),
+        )
+        .padding([2, 8])
+        .style(|_theme: &Theme| container::Appearance {
+            background: Some(Background::Color(Color::from_rgb(0.4, 0.6, 0.9))),
+            border: Border {
+                radius: 12.0.into(),
+                width: 0.0,
+                color: Color::TRANSPARENT,
+            },
+            ..Default::default()
+        });
 
         let duration = Text::new(duration_text)
-            .size(11.0);
+            .size(11.0)
+            .style(Color::from_rgb(0.75, 0.75, 0.75));
 
         let header = Row::new()
             .push(prompt)
             .push(command)
-            .push(Container::new(Row::new()
-                .push(status)
-                .push(Text::new(" "))
-                .push(duration)
-                .spacing(5))
-                .width(Length::Shrink))
+            .spacing(8)
+            .align_items(Alignment::Center);
+
+        let meta_row = Row::new()
+            .push(status)
+            .push(duration)
             .spacing(8)
             .align_items(Alignment::Center);
 
         let mut column = Column::new()
             .push(header)
-            .spacing(8)
-            .padding(12);
+            .push(meta_row)
+            .spacing(6)
+            .padding([10, 12]);
 
-        if !block.output.is_empty() {
-            let output_text = Text::new(&block.output)
+        let live_output_text = if !block.output.is_empty() {
+            block.output.clone()
+        } else {
+            screen_to_text(screen)
+        };
+
+        if !live_output_text.trim().is_empty() {
+            let output_text = Text::new(live_output_text)
                 .font(Font::MONOSPACE)
                 .size(theme_config.font_size - 3.0);
             let output_container = Container::new(output_text)
-                .padding(8);
+                .padding(8)
+                .style(|_theme: &Theme| container::Appearance {
+                    background: Some(Background::Color(Color::from_rgb(0.18, 0.18, 0.18))),
+                    border: Border {
+                        radius: 6.0.into(),
+                        width: 1.0,
+                        color: Color::from_rgb(0.25, 0.25, 0.25),
+                    },
+                    ..Default::default()
+                });
             column = column.push(output_container);
         }
 
         Container::new(column)
             .width(Length::Fill)
-            .padding(10)
+            .padding(6)
+            .style(|_theme: &Theme| container::Appearance {
+                background: Some(Background::Color(Color::from_rgb(0.13, 0.13, 0.13))),
+                border: Border {
+                    radius: 10.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.2, 0.2, 0.2),
+                },
+                ..Default::default()
+            })
             .into()
     }
 }
