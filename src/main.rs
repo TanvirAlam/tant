@@ -10,9 +10,11 @@ use std::sync::{Arc, Mutex};
 mod pty;
 mod parser;
 mod renderer;
+mod export;
 
 use parser::{TerminalParser, ParserEvent, GitStatus};
 use renderer::{TerminalRenderer, StyleRun};
+use export::{ExportFormat, format_blocks, write_export_file};
 use pty::PtyManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +38,8 @@ pub struct Block {
     pub output_range: Option<(usize, usize)>,
     pub pinned: bool,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub selected: bool,
     // Keep output for now, until shared store is implemented
     pub output: String,
     pub git_branch: Option<String>,
@@ -175,6 +179,13 @@ pub enum Message {
     RerunCommand(usize),
     CopyCommand(usize),
     CopyOutput(usize),
+    ToggleBlockSelected(usize),
+    SelectAllBlocks,
+    DeselectAllBlocks,
+    ExportBlock(usize, ExportFormat),
+    ExportSelected(ExportFormat),
+    CopyBlockExport(usize, ExportFormat),
+    CopySelectedExport(ExportFormat),
     ToggleCollapsed(usize),
     UpdateCurrent(String),
     RunCurrent,
@@ -624,6 +635,7 @@ impl Application for Tant {
                                         output_range: None,
                                         pinned: false,
                                         tags: vec![],
+                                        selected: false,
                                         output: String::new(),
                                         git_branch: None,
                                         git_status: None,
@@ -779,6 +791,88 @@ impl Application for Tant {
                     if let Some(pane) = tab.panes.get(tab.active_pane) {
                         if let Some(block) = pane.history.get(index) {
                             return clipboard::write(block.output.clone());
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::ToggleBlockSelected(index) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        if let Some(block) = pane.history.get_mut(index) {
+                            block.selected = !block.selected;
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::SelectAllBlocks => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        for block in &mut pane.history {
+                            block.selected = true;
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::DeselectAllBlocks => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        for block in &mut pane.history {
+                            block.selected = false;
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::ExportBlock(index, format) => {
+                if let Some(tab) = self.layout.get(self.active_tab) {
+                    if let Some(pane) = tab.panes.get(tab.active_pane) {
+                        if let Some(block) = pane.history.get(index) {
+                            if let Ok(result) = format_blocks(std::slice::from_ref(block), format) {
+                                let _ = write_export_file(std::path::Path::new("exports"), format, &result.content);
+                                return clipboard::write(result.content);
+                            }
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::ExportSelected(format) => {
+                if let Some(tab) = self.layout.get(self.active_tab) {
+                    if let Some(pane) = tab.panes.get(tab.active_pane) {
+                        let selected: Vec<Block> = pane.history.iter().filter(|b| b.selected).cloned().collect();
+                        if !selected.is_empty() {
+                            if let Ok(result) = format_blocks(&selected, format) {
+                                let _ = write_export_file(std::path::Path::new("exports"), format, &result.content);
+                                return clipboard::write(result.content);
+                            }
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::CopyBlockExport(index, format) => {
+                if let Some(tab) = self.layout.get(self.active_tab) {
+                    if let Some(pane) = tab.panes.get(tab.active_pane) {
+                        if let Some(block) = pane.history.get(index) {
+                            if let Ok(result) = format_blocks(std::slice::from_ref(block), format) {
+                                return clipboard::write(result.content);
+                            }
+                        }
+                    }
+                }
+                Command::none()
+            }
+            Message::CopySelectedExport(format) => {
+                if let Some(tab) = self.layout.get(self.active_tab) {
+                    if let Some(pane) = tab.panes.get(tab.active_pane) {
+                        let selected: Vec<Block> = pane.history.iter().filter(|b| b.selected).cloned().collect();
+                        if !selected.is_empty() {
+                            if let Ok(result) = format_blocks(&selected, format) {
+                                return clipboard::write(result.content);
+                            }
                         }
                     }
                 }

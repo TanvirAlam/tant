@@ -1,6 +1,6 @@
 // Renderer + UI shell
 
-use iced::widget::{Canvas, Column, Row, Text, Scrollable, Container, container};
+use iced::widget::{Canvas, Column, Row, Text, Scrollable, Container, container, Checkbox};
 use iced::widget::button::Button;
 use iced::widget::text_input::TextInput;
 use iced::{Element, Length, Color, Point, Size, Rectangle, Theme, Pixels, Font, Alignment, Border, Background};
@@ -9,6 +9,7 @@ use iced::mouse::Cursor;
 use vt100;
 use chrono::Utc;
 use crate::{Message, AiSettings, Block, ThemeConfig};
+use crate::export::ExportFormat;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher, DefaultHasher};
 use std::sync::{Arc, Mutex};
@@ -252,6 +253,19 @@ impl TerminalRenderer {
         let clear_filter = Button::new(Text::new("Clear").size(11.0))
             .on_press(Message::ClearSearch);
 
+        let select_all = Button::new(Text::new("Select all").size(11.0))
+            .on_press(Message::SelectAllBlocks);
+        let deselect_all = Button::new(Text::new("Deselect all").size(11.0))
+            .on_press(Message::DeselectAllBlocks);
+        let export_selected_md = Button::new(Text::new("Export MD").size(11.0))
+            .on_press(Message::ExportSelected(ExportFormat::Markdown));
+        let export_selected_json = Button::new(Text::new("Export JSON").size(11.0))
+            .on_press(Message::ExportSelected(ExportFormat::Json));
+        let export_selected_html = Button::new(Text::new("Export HTML").size(11.0))
+            .on_press(Message::ExportSelected(ExportFormat::Html));
+        let export_selected_text = Button::new(Text::new("Export TXT").size(11.0))
+            .on_press(Message::ExportSelected(ExportFormat::Text));
+
         let search_row = Row::new()
             .push(Container::new(search_input).width(Length::Fill))
             .push(search_badge)
@@ -259,6 +273,12 @@ impl TerminalRenderer {
             .push(failure_filter)
             .push(pinned_filter)
             .push(clear_filter)
+            .push(select_all)
+            .push(deselect_all)
+            .push(export_selected_md)
+            .push(export_selected_json)
+            .push(export_selected_html)
+            .push(export_selected_text)
             .spacing(8)
             .align_items(Alignment::Center);
 
@@ -463,7 +483,10 @@ impl TerminalRenderer {
             .size(11.0)
             .style(Color::from_rgb(0.75, 0.75, 0.75));
 
+        let select_checkbox = Checkbox::new("", block.selected)
+            .on_toggle(move |_| Message::ToggleBlockSelected(index));
         let header = Row::new()
+            .push(select_checkbox)
             .push(prompt)
             .push(command)
             .spacing(8)
@@ -478,6 +501,10 @@ impl TerminalRenderer {
         let buttons = Row::new()
             .push(Button::new(Text::new("Copy").size(11.0)).on_press(Message::CopyCommand(index)))
             .push(Button::new(Text::new("Copy Output").size(11.0)).on_press(Message::CopyOutput(index)))
+            .push(Button::new(Text::new("Export MD").size(11.0)).on_press(Message::ExportBlock(index, ExportFormat::Markdown)))
+            .push(Button::new(Text::new("Export JSON").size(11.0)).on_press(Message::ExportBlock(index, ExportFormat::Json)))
+            .push(Button::new(Text::new("Export HTML").size(11.0)).on_press(Message::ExportBlock(index, ExportFormat::Html)))
+            .push(Button::new(Text::new("Export TXT").size(11.0)).on_press(Message::ExportBlock(index, ExportFormat::Text)))
             .push(Button::new(Text::new("Rerun").size(11.0)).on_press(Message::RerunCommand(index)))
             .push(Button::new(Text::new(if block.collapsed { "Show" } else { "Hide" }).size(11.0)).on_press(Message::ToggleCollapsed(index)))
             .push(Button::new(Text::new(if block.pinned { "📌" } else { "Pin" }).size(11.0)).on_press(Message::TogglePin(index)))
