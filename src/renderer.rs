@@ -238,7 +238,7 @@ impl TerminalRenderer {
         let block_for_metadata = current.as_ref().or_else(|| history.last());
         
         // Get metadata from block or use fallbacks
-        let (cwd_str, git_branch, git_status, host) = if let Some(block) = block_for_metadata {
+        let (cwd_str, git_branch, git_status, host, is_remote) = if let Some(block) = block_for_metadata {
             (
                 block.cwd.as_ref()
                     .map(|p| p.display().to_string())
@@ -246,6 +246,7 @@ impl TerminalRenderer {
                 block.git_branch.clone(),
                 block.git_status.clone(),
                 block.host.clone(),
+                block.is_remote,
             )
         } else {
             // Fallback values when no blocks exist
@@ -256,6 +257,7 @@ impl TerminalRenderer {
                 None,
                 None,
                 "localhost".to_string(),
+                false,
             )
         };
         
@@ -298,9 +300,15 @@ impl TerminalRenderer {
         }
         
         // Host label
+        let host_icon = if is_remote { "🛰️ " } else { "💻 " };
+        let host_color = if is_remote {
+            Color::from_rgb(0.85, 0.55, 0.2)
+        } else {
+            Color::from_rgb(0.7, 0.7, 0.7)
+        };
         let host_label = Row::new()
-            .push(Text::new("💻 ").size(10.0))
-            .push(Text::new(host).size(10.0).font(Font::MONOSPACE))
+            .push(Text::new(host_icon).size(10.0))
+            .push(Text::new(host).size(10.0).font(Font::MONOSPACE).style(host_color))
             .spacing(3);
         metadata_row = metadata_row.push(host_label);
 

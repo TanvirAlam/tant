@@ -42,6 +42,8 @@ pub struct Block {
     pub git_status: Option<GitStatus>,
     pub host: String,
     #[serde(default)]
+    pub is_remote: bool,
+    #[serde(default)]
     pub collapsed: bool,
 }
 
@@ -218,6 +220,49 @@ struct Tant {
     render_cache: Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>,
     row_hashes: Arc<Mutex<HashMap<(usize, usize, u16), u64>>>,
     theme_config: ThemeConfig,
+    host_info: HostInfo,
+}
+
+#[derive(Debug, Clone)]
+struct HostInfo {
+    display: String,
+    is_remote: bool,
+}
+
+fn is_remote_session() -> bool {
+    std::env::var("SSH_CONNECTION").is_ok()
+        || std::env::var("SSH_CLIENT").is_ok()
+        || std::env::var("SSH_TTY").is_ok()
+}
+
+fn get_hostname() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn get_username() -> Option<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+}
+
+fn resolve_host_info() -> HostInfo {
+    let hostname = get_hostname();
+    let is_remote = is_remote_session();
+    let display = if is_remote {
+        if let Some(user) = get_username() {
+            format!("{}@{}", user, hostname)
+        } else {
+            hostname
+        }
+    } else {
+        hostname
+    };
+    HostInfo { display, is_remote }
 }
 
 impl Tant {
@@ -517,7 +562,7 @@ impl Application for Tant {
             colors: HashMap::new(), // Will add defaults later
         };
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config },
+            Tant { layout, active_tab, renderer, search_query: String::new(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info() },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -572,7 +617,8 @@ impl Application for Tant {
                                         output: String::new(),
                                         git_branch: None,
                                         git_status: None,
-                                        host: "localhost".to_string(), // TODO: get actual host
+                                        host: self.host_info.display.clone(),
+                                        is_remote: self.host_info.is_remote,
                                         collapsed: false,
                                     });
                                     eprintln!("[Block Detection] Command started - new block created");
