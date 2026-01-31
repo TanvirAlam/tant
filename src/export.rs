@@ -102,3 +102,8 @@ fn html_escape(input: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
+
+#[cfg(test)]
+mod tests {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/__tests__/export_tests.rs"));
+}
