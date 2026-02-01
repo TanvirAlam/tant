@@ -71,6 +71,15 @@ pub struct Pane {
     pub mouse_button_down: bool,
     pub last_cursor_pos: Point,
     pub title: String,
+    pub ai_panel_open: bool,
+    pub ai_context_scope: AiContextScope,
+    pub ai_chat: Vec<AiChatMessage>,
+    pub ai_input: String,
+    pub ai_pending: bool,
+    pub ai_streaming: bool,
+    pub ai_stream_remaining: String,
+    pub ai_stream_target: Option<usize>,
+    pub ai_request_id: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,6 +123,34 @@ pub struct AiSettings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum AiContextScope {
+    CurrentCommand,
+    LastNBlocks,
+    SelectedBlocks,
+    EntireSession,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AiChatRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone)]
+pub struct AiChatMessage {
+    pub role: AiChatRole,
+    pub content: String,
+    pub sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AiQuickAction {
+    ExplainError,
+    SummarizeOutput,
+    GenerateCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Axis {
     Horizontal,
     Vertical,
@@ -127,6 +164,7 @@ pub enum PaletteAction {
     SwitchTab(usize),
     RunPinnedCommand(usize),
     ToggleAi,
+    ToggleAiPanel,
     ExportTheme,
     ImportTheme,
     // Add more as needed
@@ -166,7 +204,16 @@ impl Pane {
             selection_end: None,
             mouse_button_down: false,
             last_cursor_pos: Point { x: 0.0, y: 0.0 },
-    title: "Terminal".to_string(),
+            title: "Terminal".to_string(),
+            ai_panel_open: false,
+            ai_context_scope: AiContextScope::LastNBlocks,
+            ai_chat: Vec::new(),
+            ai_input: String::new(),
+            ai_pending: false,
+            ai_streaming: false,
+            ai_stream_remaining: String::new(),
+            ai_stream_target: None,
+            ai_request_id: 0,
         })
     }
 }
@@ -208,6 +255,13 @@ pub enum Message {
     AiGenerateCommand,
     AiSummarizeOutput,
     AiResponse(String),
+    AiResponseReceived(usize, u64, String),
+    ToggleAiPanel,
+    AiPanelInputChanged(usize, String),
+    AiPanelSend(usize),
+    AiPanelStop(usize),
+    AiPanelSetScope(usize, AiContextScope),
+    AiPanelQuickAction(usize, AiQuickAction),
     ToggleAiEnabled,
     UpdateAiSettings(AiSettings),
     Paste(String),
@@ -335,6 +389,60 @@ fn resolve_host_info() -> HostInfo {
 }
 
 impl Tant {
+    fn block_label(&self, index: usize, block: &Block) -> String {
+        if let Some(started) = block.started_at {
+            format!("block#{} ({})", index + 1, started.to_rfc3339())
+        } else {
+            format!("block#{}", index + 1)
+        }
+    }
+
+    fn build_ai_context(&self, pane: &Pane, scope: AiContextScope) -> (String, Vec<String>) {
+        let mut sources = Vec::new();
+        let mut context = String::new();
+        let cwd = pane.working_directory.clone();
+        let host = self.host_info.display.clone();
+        context.push_str(&format!("Environment:\n- cwd: {}\n- host: {}\n", cwd, host));
+
+        let blocks: Vec<(usize, &Block)> = match scope {
+            AiContextScope::CurrentCommand => Vec::new(),
+            AiContextScope::LastNBlocks => {
+                let start = pane.history.len().saturating_sub(self.ai_settings.send_last_n_blocks.max(1));
+                pane.history.iter().enumerate().skip(start).collect()
+            }
+            AiContextScope::SelectedBlocks => pane
+                .history
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| block.selected)
+                .collect(),
+            AiContextScope::EntireSession => pane.history.iter().enumerate().collect(),
+        };
+
+        match scope {
+            AiContextScope::CurrentCommand => {
+                sources.push("current_command".to_string());
+                context.push_str("\nCurrent command:\n");
+                context.push_str(&pane.current_command);
+                context.push('\n');
+            }
+            _ => {
+                if blocks.is_empty() {
+                    context.push_str("\nNo command blocks available for the selected scope.\n");
+                } else {
+                    context.push_str("\nCommand blocks:\n");
+                    for (index, block) in blocks {
+                        let label = self.block_label(index, block);
+                        sources.push(label.clone());
+                        context.push_str(&format!("\n[{}]\nCommand: {}\nExit: {:?}\nOutput:\n{}\n", label, block.command, block.exit_code, block.output));
+                    }
+                }
+            }
+        }
+
+        (context, sources)
+    }
+
     fn update_history_matches(&mut self) {
         let query = self.history_search_query.to_lowercase();
         let mut matches = Vec::new();
@@ -755,27 +863,7 @@ impl Tant {
         Ok(())
     }
 
-    fn collect_ai_data(&self, include_current: bool, last_n: usize) -> String {
-        let mut data = String::new();
-        if let Some(tab) = self.layout.get(self.active_tab) {
-            if let Some(pane) = tab.panes.get(tab.active_pane) {
-                if include_current && self.ai_settings.send_current_command {
-                    data.push_str(&format!("Current command: {}\n", pane.current_command));
-                }
-                if self.ai_settings.send_last_n_blocks > 0 {
-                    let start = pane.history.len().saturating_sub(last_n);
-                    for block in &pane.history[start..] {
-                        data.push_str(&format!("Command: {}\nOutput: {}\nExit Code: {:?}\n\n", block.command, block.output, block.exit_code));
-                    }
-                }
-                // Repo context not implemented yet
-            }
-        }
-        data
-    }
-
-
-    fn build_ai_request(&self, prompt: &str, action: &str) -> AiRequest {
+    fn build_ai_prompt(&self, action: &str, user_text: &str, context: &str) -> AiRequest {
         let system = match action {
             "explain_error" => "Explain the error and likely cause in concise terms.",
             "suggest_fix" => "Suggest a practical fix and a command to try.",
@@ -789,12 +877,22 @@ impl Tant {
             "ollama" => "llama3.2:latest",
             _ => "gpt-4o-mini",
         };
+        let user = if user_text.trim().is_empty() {
+            format!("{}", context)
+        } else {
+            format!("{}\n\nUser request:\n{}", context, user_text)
+        };
         AiRequest {
             provider: self.ai_settings.provider.clone(),
             model: model.to_string(),
             system: system.to_string(),
-            user: prompt.to_string(),
+            user,
         }
+    }
+
+
+    fn build_ai_request(&self, prompt: &str, action: &str) -> AiRequest {
+        self.build_ai_prompt(action, "", prompt)
     }
 
     fn execute_palette_action(&mut self, action: PaletteAction) {
@@ -835,6 +933,13 @@ impl Tant {
             }
             PaletteAction::ToggleAi => {
                 self.ai_settings.enabled = !self.ai_settings.enabled;
+            }
+            PaletteAction::ToggleAiPanel => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        pane.ai_panel_open = !pane.ai_panel_open;
+                    }
+                }
             }
             PaletteAction::ExportTheme => {
                 if let Err(e) = self.export_theme() {
@@ -890,6 +995,7 @@ impl Tant {
             ("Split Pane Vertical", PaletteAction::SplitPaneVertical),
             ("Close Pane", PaletteAction::ClosePane),
             ("Toggle AI", PaletteAction::ToggleAi),
+            ("Toggle AI Panel", PaletteAction::ToggleAiPanel),
             ("Export Theme", PaletteAction::ExportTheme),
             ("Import Theme", PaletteAction::ImportTheme),
         ];
@@ -972,6 +1078,29 @@ impl Application for Tant {
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::Tick => {
+                for tab in &mut self.layout {
+                    for pane in &mut tab.panes {
+                        if pane.ai_streaming {
+                            if let Some(target) = pane.ai_stream_target {
+                                if let Some(message) = pane.ai_chat.get_mut(target) {
+                                    if !pane.ai_stream_remaining.is_empty() {
+                                        let chunk_size = 6;
+                                        let take = pane.ai_stream_remaining.char_indices().nth(chunk_size).map(|(idx, _)| idx).unwrap_or(pane.ai_stream_remaining.len());
+                                        let chunk: String = pane.ai_stream_remaining.drain(..take).collect();
+                                        message.content.push_str(&chunk);
+                                    }
+                                    if pane.ai_stream_remaining.is_empty() && !pane.ai_pending {
+                                        pane.ai_streaming = false;
+                                        pane.ai_stream_target = None;
+                                    }
+                                } else {
+                                    pane.ai_streaming = false;
+                                    pane.ai_stream_target = None;
+                                }
+                            }
+                        }
+                    }
+                }
                 let mut has_new_data = false;
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
@@ -1154,6 +1283,10 @@ impl Application for Tant {
                 let is_cmd = modifiers.command();
                 let is_ctrl = modifiers.control();
                 let is_shift = modifiers.shift();
+
+                if (is_cmd || is_ctrl) && matches!(key, Key::Character(ref c) if c == "i") {
+                    return self.update(Message::ToggleAiPanel);
+                }
 
                 if is_ctrl && matches!(key, Key::Character(ref c) if c == "r") {
                     return self.update(Message::StartHistorySearch);
@@ -1642,8 +1775,8 @@ impl Application for Tant {
             }
             Message::AiExplainError => {
                 if self.ai_settings.enabled {
-                    let data = self.collect_ai_data(true, self.ai_settings.send_last_n_blocks);
-                    let request = self.build_ai_request(&data, "explain_error");
+                    let data = self.build_ai_request("", "explain_error");
+                    let request = data;
                     return Command::perform(
                         async move { send_request(request).await },
                         move |result| match result {
@@ -1656,8 +1789,8 @@ impl Application for Tant {
             }
             Message::AiSuggestFix => {
                 if self.ai_settings.enabled {
-                    let data = self.collect_ai_data(true, self.ai_settings.send_last_n_blocks);
-                    let request = self.build_ai_request(&data, "suggest_fix");
+                    let data = self.build_ai_request("", "suggest_fix");
+                    let request = data;
                     return Command::perform(
                         async move { send_request(request).await },
                         move |result| match result {
@@ -1670,8 +1803,8 @@ impl Application for Tant {
             }
             Message::AiGenerateCommand => {
                 if self.ai_settings.enabled {
-                    let data = self.collect_ai_data(false, 0);
-                    let request = self.build_ai_request(&data, "generate_command");
+                    let data = self.build_ai_request("", "generate_command");
+                    let request = data;
                     return Command::perform(
                         async move { send_request(request).await },
                         move |result| match result {
@@ -1684,8 +1817,8 @@ impl Application for Tant {
             }
             Message::AiSummarizeOutput => {
                 if self.ai_settings.enabled {
-                    let data = self.collect_ai_data(false, self.ai_settings.send_last_n_blocks);
-                    let request = self.build_ai_request(&data, "summarize_output");
+                    let data = self.build_ai_request("", "summarize_output");
+                    let request = data;
                     return Command::perform(
                         async move { send_request(request).await },
                         move |result| match result {
@@ -1693,6 +1826,122 @@ impl Application for Tant {
                             Err(err) => Message::AiResponse(format!("AI error ({})", err)),
                         },
                     );
+                }
+                Command::none()
+            }
+            Message::ToggleAiPanel => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        pane.ai_panel_open = !pane.ai_panel_open;
+                    }
+                }
+                Command::none()
+            }
+            Message::AiPanelInputChanged(pane_id, value) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        pane.ai_input = value;
+                    }
+                }
+                Command::none()
+            }
+            Message::AiPanelSetScope(pane_id, scope) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        pane.ai_context_scope = scope;
+                    }
+                }
+                Command::none()
+            }
+            Message::AiPanelQuickAction(pane_id, action) => {
+                let action_label = match action {
+                    AiQuickAction::ExplainError => "Explain Error",
+                    AiQuickAction::SummarizeOutput => "Summarize Output",
+                    AiQuickAction::GenerateCommand => "Generate Command",
+                };
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        pane.ai_input = action_label.to_string();
+                    }
+                }
+                self.update(Message::AiPanelSend(pane_id))
+            }
+            Message::AiPanelSend(pane_id) => {
+                if !self.ai_settings.enabled {
+                    return Command::none();
+                }
+
+                let (user_text, context, sources) = if let Some(tab) = self.layout.get(self.active_tab) {
+                    if let Some(pane) = tab.panes.get(pane_id) {
+                        let user_text = pane.ai_input.trim().to_string();
+                        if user_text.is_empty() {
+                            return Command::none();
+                        }
+                        let (context, sources) = self.build_ai_context(pane, pane.ai_context_scope);
+                        (user_text, context, sources)
+                    } else {
+                        return Command::none();
+                    }
+                } else {
+                    return Command::none();
+                };
+
+                let request_id = if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        pane.ai_input.clear();
+                        pane.ai_pending = true;
+                        pane.ai_streaming = true;
+                        pane.ai_request_id = pane.ai_request_id.wrapping_add(1);
+                        let request_id = pane.ai_request_id;
+                        let user_message = AiChatMessage {
+                            role: AiChatRole::User,
+                            content: user_text.clone(),
+                            sources: sources.clone(),
+                        };
+                        let assistant = AiChatMessage {
+                            role: AiChatRole::Assistant,
+                            content: String::new(),
+                            sources,
+                        };
+                        pane.ai_chat.push(user_message);
+                        pane.ai_chat.push(assistant);
+                        pane.ai_stream_target = Some(pane.ai_chat.len().saturating_sub(1));
+                        request_id
+                    } else {
+                        return Command::none();
+                    }
+                } else {
+                    return Command::none();
+                };
+
+                let request = self.build_ai_prompt("respond", &user_text, &context);
+                Command::perform(
+                    async move { send_request(request).await },
+                    move |result| match result {
+                        Ok(resp) => Message::AiResponseReceived(pane_id, request_id, resp.content),
+                        Err(err) => Message::AiResponseReceived(pane_id, request_id, format!("AI error ({})", err)),
+                    },
+                )
+            }
+            Message::AiPanelStop(pane_id) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        pane.ai_streaming = false;
+                        pane.ai_pending = false;
+                        pane.ai_stream_remaining.clear();
+                        pane.ai_stream_target = None;
+                    }
+                }
+                Command::none()
+            }
+            Message::AiResponseReceived(pane_id, request_id, response) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        if pane.ai_request_id == request_id {
+                            pane.ai_pending = false;
+                            pane.ai_stream_remaining = response;
+                        }
+                    }
                 }
                 Command::none()
             }
@@ -1922,7 +2171,7 @@ impl Application for Tant {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected)
+            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false)
         };
 
         if self.show_command_palette {
@@ -1986,7 +2235,7 @@ impl Tant {
         match node {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
-                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected);
+                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, pane.ai_panel_open, pane.ai_context_scope, &pane.ai_chat, &pane.ai_input, pane.ai_pending, pane.ai_streaming);
                     let is_active = self
                         .layout
                         .get(self.active_tab)
@@ -2012,7 +2261,7 @@ impl Tant {
                         .into()
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
-                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected)
+                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false)
                 }
             }
             LayoutNode::Split { axis, ratio, left, right } => {

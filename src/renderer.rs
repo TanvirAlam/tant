@@ -8,7 +8,7 @@ use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
 use vt100;
 use chrono::Utc;
-use crate::{Message, AiSettings, Block, ThemeConfig, Tab};
+use crate::{Message, AiSettings, Block, ThemeConfig, Tab, AiChatMessage, AiChatRole, AiContextScope, AiQuickAction};
 use crate::export::ExportFormat;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher, DefaultHasher};
@@ -223,10 +223,10 @@ impl TerminalRenderer {
         (8.0, theme_config.line_height * theme_config.font_size)
     }
 
-    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize) -> Element<'a, Message> {
+    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize, ai_panel_open: bool, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool) -> Element<'a, Message> {
         // Use raw terminal mode for TUI apps (vim, top, etc.), block mode for normal shell
         if alt_screen_active {
-            Canvas::new(TerminalCanvas {
+            let canvas = Canvas::new(TerminalCanvas {
                 screen: screen.clone(),
                 cell_width: 8.0,
                 cell_height: theme_config.line_height * theme_config.font_size,
@@ -236,14 +236,24 @@ impl TerminalRenderer {
                 pane_id,
             })
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill);
+
+            if ai_panel_open {
+                let panel = self.render_ai_panel(ai_context_scope, ai_chat, ai_input, ai_pending, ai_streaming, pane_id, theme_config);
+                Row::new()
+                    .push(Container::new(canvas).width(Length::FillPortion(7)))
+                    .push(Container::new(panel).width(Length::FillPortion(3)))
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                canvas.into()
+            }
         } else {
-            self.render_blocks(history, current, current_command, search_query, search_success_only, search_failure_only, search_pinned_only, search_input_id, screen, theme_config, tabs, active_tab, renaming_tab, rename_buffer, history_search_active, history_search_query, history_matches, history_selected)
+            self.render_blocks(history, current, current_command, search_query, search_success_only, search_failure_only, search_pinned_only, search_input_id, screen, theme_config, tabs, active_tab, renaming_tab, rename_buffer, history_search_active, history_search_query, history_matches, history_selected, ai_panel_open, ai_context_scope, ai_chat, ai_input, ai_pending, ai_streaming, pane_id)
         }
     }
 
-    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize) -> Element<'a, Message> {
+    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize, ai_panel_open: bool, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, pane_id: usize) -> Element<'a, Message> {
         let mut column = Column::new().spacing(10).padding(theme_config.padding as u16);
 
         let live_screen_text = screen_to_text(screen);
@@ -514,11 +524,142 @@ impl TerminalRenderer {
             .height(Length::FillPortion(1))
             .padding(0);
 
-        Column::new()
+        let terminal_column = Column::new()
             .push(scrollable)
             .push(input_container)
             .height(Length::Fill)
-            .spacing(0)
+            .spacing(0);
+
+        let main_area: Element<'a, Message> = if ai_panel_open {
+            let panel = self.render_ai_panel(ai_context_scope, ai_chat, ai_input, ai_pending, ai_streaming, pane_id, theme_config);
+            Row::new()
+                .push(Container::new(terminal_column).width(Length::FillPortion(7)))
+                .push(Container::new(panel).width(Length::FillPortion(3)))
+                .height(Length::Fill)
+                .into()
+        } else {
+            terminal_column.into()
+        };
+
+        main_area
+    }
+
+    fn render_ai_panel<'a>(&self, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, pane_id: usize, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
+        let mut header = Row::new().spacing(8).align_items(Alignment::Center);
+        header = header.push(Text::new("AI Assistant").size(14.0));
+
+        let scope_label = match ai_context_scope {
+            AiContextScope::CurrentCommand => "Context: Current command",
+            AiContextScope::LastNBlocks => "Context: Last N blocks",
+            AiContextScope::SelectedBlocks => "Context: Selected blocks",
+            AiContextScope::EntireSession => "Context: Entire session",
+        };
+        let scope_text = Text::new(scope_label).size(11.0).style(Color::from_rgb(0.7, 0.7, 0.7));
+
+        let scope_row = Row::new()
+            .push(Button::new(Text::new("Current").size(11.0)).on_press(Message::AiPanelSetScope(pane_id, AiContextScope::CurrentCommand)))
+            .push(Button::new(Text::new("Last N").size(11.0)).on_press(Message::AiPanelSetScope(pane_id, AiContextScope::LastNBlocks)))
+            .push(Button::new(Text::new("Selected").size(11.0)).on_press(Message::AiPanelSetScope(pane_id, AiContextScope::SelectedBlocks)))
+            .push(Button::new(Text::new("All").size(11.0)).on_press(Message::AiPanelSetScope(pane_id, AiContextScope::EntireSession)))
+            .spacing(6);
+
+        let quick_actions = Row::new()
+            .push(Button::new(Text::new("Explain Error").size(11.0)).on_press(Message::AiPanelQuickAction(pane_id, AiQuickAction::ExplainError)))
+            .push(Button::new(Text::new("Summarize Output").size(11.0)).on_press(Message::AiPanelQuickAction(pane_id, AiQuickAction::SummarizeOutput)))
+            .push(Button::new(Text::new("Generate Command").size(11.0)).on_press(Message::AiPanelQuickAction(pane_id, AiQuickAction::GenerateCommand)))
+            .spacing(6);
+
+        let mut chat_column = Column::new().spacing(8);
+        for message in ai_chat {
+            let role_label = match message.role {
+                AiChatRole::User => "You",
+                AiChatRole::Assistant => "AI",
+            };
+            let role_color = match message.role {
+                AiChatRole::User => Color::from_rgb(0.55, 0.75, 0.95),
+                AiChatRole::Assistant => Color::from_rgb(0.75, 0.85, 0.65),
+            };
+            let header = Row::new()
+                .push(Text::new(role_label).size(11.0).style(role_color))
+                .spacing(4);
+
+            let sources = if message.sources.is_empty() {
+                Text::new("sources: none").size(10.0).style(Color::from_rgb(0.55, 0.55, 0.55))
+            } else {
+                Text::new(format!("sources: {}", message.sources.join(", ")))
+                    .size(10.0)
+                    .style(Color::from_rgb(0.55, 0.55, 0.55))
+            };
+            let body = Text::new(message.content.clone())
+                .font(Font::MONOSPACE)
+                .size(theme_config.font_size - 2.0);
+            let bubble = Column::new().spacing(4).push(header).push(sources).push(body);
+            let bubble_container = Container::new(bubble)
+                .padding(8)
+                .style(|_theme: &Theme| container::Appearance {
+                    background: Some(Background::Color(Color::from_rgb(0.16, 0.16, 0.18))),
+                    border: Border {
+                        radius: 6.0.into(),
+                        width: 1.0,
+                        color: Color::from_rgb(0.24, 0.24, 0.24),
+                    },
+                    ..Default::default()
+                });
+            chat_column = chat_column.push(bubble_container);
+        }
+
+        let chat_scroll = Scrollable::new(chat_column)
+            .height(Length::Fill)
+            .width(Length::Fill);
+
+        let input = TextInput::new("Ask anything...", ai_input)
+            .on_input(move |value| Message::AiPanelInputChanged(pane_id, value))
+            .on_submit(Message::AiPanelSend(pane_id))
+            .padding(8)
+            .size(theme_config.font_size - 1.0)
+            .font(Font::MONOSPACE);
+
+        let send_button = Button::new(Text::new("Send").size(12.0))
+            .on_press(Message::AiPanelSend(pane_id));
+        let stop_button = Button::new(Text::new("Stop").size(12.0))
+            .on_press(Message::AiPanelStop(pane_id));
+
+        let status_text = if ai_pending || ai_streaming {
+            Text::new("Generating...").size(11.0).style(Color::from_rgb(0.75, 0.75, 0.75))
+        } else {
+            Text::new("Idle").size(11.0).style(Color::from_rgb(0.55, 0.55, 0.55))
+        };
+
+        let input_row = Row::new()
+            .push(Container::new(input).width(Length::Fill))
+            .push(send_button)
+            .push(stop_button)
+            .spacing(6)
+            .align_items(Alignment::Center);
+
+        let body = Column::new()
+            .spacing(10)
+            .push(header)
+            .push(scope_text)
+            .push(scope_row)
+            .push(quick_actions)
+            .push(chat_scroll)
+            .push(input_row)
+            .push(status_text)
+            .padding(10);
+
+        Container::new(body)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &Theme| container::Appearance {
+                background: Some(Background::Color(Color::from_rgb(0.12, 0.13, 0.16))),
+                border: Border {
+                    radius: 6.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.22, 0.22, 0.22),
+                },
+                ..Default::default()
+            })
             .into()
     }
 
