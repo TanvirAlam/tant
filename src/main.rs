@@ -86,6 +86,7 @@ pub struct Pane {
     pub ai_redaction_override: bool,
     pub ai_last_redactions: Vec<String>,
     pub ai_last_redacted_preview: Option<String>,
+    pub ai_selected_template: Option<AiPromptTemplateId>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -128,6 +129,18 @@ pub struct AiSettings {
     pub api_key: Option<String>,
     pub redact_secrets: bool,
     pub allow_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub ai_onboarding_seen: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self { ai_onboarding_seen: false }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +200,60 @@ pub enum AiQuickAction {
     GenerateCommand,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AiPromptTemplateId {
+    ExplainError,
+    DebugCommand,
+    SummarizeOutput,
+    GenerateCommand,
+    RefactorSnippet,
+}
+
+#[derive(Debug, Clone)]
+pub struct AiPromptTemplate {
+    pub id: AiPromptTemplateId,
+    pub label: &'static str,
+    pub prompt: &'static str,
+    pub tip: &'static str,
+}
+
+pub const AI_PROMPT_TEMPLATES: &[AiPromptTemplate] = &[
+    AiPromptTemplate {
+        id: AiPromptTemplateId::ExplainError,
+        label: "Explain error",
+        prompt: "Explain the error below and the most likely cause.\n\nError:\n",
+        tip: "Tip: include the exact error message and the command you ran.",
+    },
+    AiPromptTemplate {
+        id: AiPromptTemplateId::DebugCommand,
+        label: "Debug command",
+        prompt: "Help me debug this command. Explain what is failing and how to fix it.\n\nCommand:\n\nOutput:\n",
+        tip: "Tip: add the full command output and any environment details.",
+    },
+    AiPromptTemplate {
+        id: AiPromptTemplateId::SummarizeOutput,
+        label: "Summarize output",
+        prompt: "Summarize the output below in a few bullets.\n\nOutput:\n",
+        tip: "Tip: include only the relevant section of output you want summarized.",
+    },
+    AiPromptTemplate {
+        id: AiPromptTemplateId::GenerateCommand,
+        label: "Generate command",
+        prompt: "Generate a command that does the following task.\n\nTask:\n",
+        tip: "Tip: specify OS, tools, and any constraints (e.g., no sudo).",
+    },
+    AiPromptTemplate {
+        id: AiPromptTemplateId::RefactorSnippet,
+        label: "Refactor snippet",
+        prompt: "Refactor the code below for clarity and best practices.\n\nCode:\n",
+        tip: "Tip: mention the language, style preferences, and any constraints.",
+    },
+];
+
+pub fn get_ai_prompt_template(id: AiPromptTemplateId) -> Option<&'static AiPromptTemplate> {
+    AI_PROMPT_TEMPLATES.iter().find(|template| template.id == id)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Axis {
     Horizontal,
@@ -203,6 +270,7 @@ pub enum PaletteAction {
     ToggleAi,
     ToggleAiPanel,
     SetAiContextScope(AiContextScope),
+    ApplyAiTemplate(AiPromptTemplateId),
     ExportTheme,
     ImportTheme,
     // Add more as needed
@@ -257,6 +325,7 @@ impl Pane {
             ai_redaction_override: false,
             ai_last_redactions: Vec::new(),
             ai_last_redacted_preview: None,
+            ai_selected_template: None,
         })
     }
 }
@@ -313,6 +382,9 @@ pub enum Message {
     AiPanelCloseRedactionPreview(usize),
     ToggleAiEnabled,
     UpdateAiSettings(AiSettings),
+    AiTemplateSelected(usize, AiPromptTemplateId),
+    AiOnboardingContinue,
+    AiOnboardingSkip,
     Paste(String),
     WindowFocused,
     WindowUnfocused,
@@ -365,6 +437,8 @@ struct Tant {
     search_input_id: text_input::Id,
     ai_settings: AiSettings,
     ai_response: Option<String>,
+    app_config: AppConfig,
+    ai_onboarding_open: bool,
     show_command_palette: bool,
     palette_query: String,
     palette_selected: usize,
@@ -445,6 +519,42 @@ fn resolve_host_info() -> HostInfo {
 }
 
 impl Tant {
+    fn load_app_config() -> AppConfig {
+        let path = std::path::Path::new("config.json");
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            serde_json::from_str::<AppConfig>(&contents).unwrap_or_default()
+        } else {
+            AppConfig::default()
+        }
+    }
+
+    fn save_app_config(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let json = serde_json::to_string_pretty(&self.app_config)?;
+        std::fs::write("config.json", json)?;
+        Ok(())
+    }
+
+    fn apply_ai_template(&mut self, pane_id: usize, template_id: AiPromptTemplateId, open_panel: bool) {
+        if let Some(template) = get_ai_prompt_template(template_id) {
+            if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                if let Some(pane) = tab.panes.get_mut(pane_id) {
+                    pane.ai_input = template.prompt.to_string();
+                    pane.ai_selected_template = Some(template_id);
+                    if open_panel {
+                        pane.ai_panel_open = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn open_ai_panel_for_active_pane(&mut self) {
+        if let Some(tab) = self.layout.get_mut(self.active_tab) {
+            if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                pane.ai_panel_open = true;
+            }
+        }
+    }
     fn default_redaction_rules() -> Vec<RedactionRule> {
         let patterns = vec![
             ("AWS Access Key", r"\bAKIA[0-9A-Z]{16}\b"),
@@ -1065,6 +1175,13 @@ impl Tant {
                     }
                 }
             }
+            PaletteAction::ApplyAiTemplate(template_id) => {
+                let pane_id = self.layout
+                    .get(self.active_tab)
+                    .map(|tab| tab.active_pane)
+                    .unwrap_or(0);
+                self.apply_ai_template(pane_id, template_id, true);
+            }
             PaletteAction::ExportTheme => {
                 if let Err(e) = self.export_theme() {
                     error!("Failed to export theme: {}", e);
@@ -1113,6 +1230,47 @@ impl Tant {
             .into()
     }
 
+    fn render_ai_onboarding(&self) -> Element<Message> {
+        let title = iced::widget::Text::new("Welcome to AI Assistant")
+            .size(18.0)
+            .style(Color::from_rgb(0.95, 0.95, 0.95));
+        let body = Column::new()
+            .spacing(8)
+            .push(iced::widget::Text::new("Get better answers by adding context and choosing a template:").size(12.0))
+            .push(iced::widget::Text::new("• Select context scope (current command, last blocks, selection). ").size(12.0))
+            .push(iced::widget::Text::new("• Use templates to structure your request quickly. ").size(12.0))
+            .push(iced::widget::Text::new("• Review redaction before sending sensitive data. ").size(12.0));
+        let privacy = iced::widget::Text::new("Privacy: prompts include your selected context only. Redaction removes secrets unless you override.")
+            .size(11.0)
+            .style(Color::from_rgb(0.7, 0.7, 0.7));
+        let buttons = Row::new()
+            .spacing(8)
+            .push(iced::widget::Button::new(iced::widget::Text::new("Get started").size(12.0)).on_press(Message::AiOnboardingContinue))
+            .push(iced::widget::Button::new(iced::widget::Text::new("Skip").size(12.0)).on_press(Message::AiOnboardingSkip));
+        let modal = Column::new()
+            .spacing(12)
+            .push(title)
+            .push(body)
+            .push(privacy)
+            .push(buttons)
+            .padding(20);
+        container(modal)
+            .center_x()
+            .center_y()
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &Theme| container::Appearance {
+                background: Some(Background::Color(Color::from_rgb(0.08, 0.09, 0.11))),
+                border: Border {
+                    radius: 8.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.2, 0.2, 0.2),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
     fn get_available_actions(&self) -> Vec<(&str, PaletteAction)> {
         let mut actions = vec![
             ("Split Pane Horizontal", PaletteAction::SplitPaneHorizontal),
@@ -1120,6 +1278,11 @@ impl Tant {
             ("Close Pane", PaletteAction::ClosePane),
             ("Toggle AI", PaletteAction::ToggleAi),
             ("Toggle AI Panel", PaletteAction::ToggleAiPanel),
+            ("AI Template: Explain error", PaletteAction::ApplyAiTemplate(AiPromptTemplateId::ExplainError)),
+            ("AI Template: Debug command", PaletteAction::ApplyAiTemplate(AiPromptTemplateId::DebugCommand)),
+            ("AI Template: Summarize output", PaletteAction::ApplyAiTemplate(AiPromptTemplateId::SummarizeOutput)),
+            ("AI Template: Generate command", PaletteAction::ApplyAiTemplate(AiPromptTemplateId::GenerateCommand)),
+            ("AI Template: Refactor snippet", PaletteAction::ApplyAiTemplate(AiPromptTemplateId::RefactorSnippet)),
             ("AI Context: Current", PaletteAction::SetAiContextScope(AiContextScope::CurrentCommand)),
             ("AI Context: Last N", PaletteAction::SetAiContextScope(AiContextScope::LastNBlocks)),
             ("AI Context: Selected", PaletteAction::SetAiContextScope(AiContextScope::SelectedBlocks)),
@@ -1184,6 +1347,8 @@ impl Application for Tant {
             (vec![tab], 0)
         };
         let renderer = TerminalRenderer::new();
+        let app_config = Self::load_app_config();
+        let ai_onboarding_open = !app_config.ai_onboarding_seen;
         let ai_settings = AiSettings {
             enabled: true,
             send_current_command: true,
@@ -1196,7 +1361,7 @@ impl Application for Tant {
         };
         let theme_config = preset_theme("one_dark");
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 }, renaming_tab: None, rename_buffer: String::new(), history_search_active: false, history_search_query: String::new(), history_matches: Vec::new(), history_selected: 0 },
+            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, app_config, ai_onboarding_open, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 }, renaming_tab: None, rename_buffer: String::new(), history_search_active: false, history_search_query: String::new(), history_matches: Vec::new(), history_selected: 0 },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -2020,6 +2185,23 @@ impl Application for Tant {
                 }
                 self.update(Message::AiPanelSend(pane_id))
             }
+            Message::AiTemplateSelected(pane_id, template_id) => {
+                self.apply_ai_template(pane_id, template_id, true);
+                Command::none()
+            }
+            Message::AiOnboardingContinue => {
+                self.ai_onboarding_open = false;
+                self.app_config.ai_onboarding_seen = true;
+                let _ = self.save_app_config();
+                self.open_ai_panel_for_active_pane();
+                Command::none()
+            }
+            Message::AiOnboardingSkip => {
+                self.ai_onboarding_open = false;
+                self.app_config.ai_onboarding_seen = true;
+                let _ = self.save_app_config();
+                Command::none()
+            }
             Message::AiPanelSend(pane_id) => {
                 if !self.ai_settings.enabled {
                     return Command::none();
@@ -2367,10 +2549,12 @@ impl Application for Tant {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None)
+            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None, None)
         };
 
-        if self.show_command_palette {
+        if self.ai_onboarding_open {
+            self.render_ai_onboarding()
+        } else if self.show_command_palette {
             self.render_command_palette()
         } else {
             layout_view
@@ -2432,7 +2616,7 @@ impl Tant {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
                     let ai_preview = self.resolve_context_preview(pane, pane.ai_context_scope);
-                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, pane.ai_panel_open, pane.ai_context_scope, &pane.ai_chat, &pane.ai_input, pane.ai_pending, pane.ai_streaming, ai_preview, pane.highlighted_block, pane.history_scroll_id.clone(), pane.ai_redaction_override, &pane.ai_last_redactions, pane.ai_last_redacted_preview.as_deref());
+                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, pane.ai_panel_open, pane.ai_context_scope, &pane.ai_chat, &pane.ai_input, pane.ai_pending, pane.ai_streaming, ai_preview, pane.highlighted_block, pane.history_scroll_id.clone(), pane.ai_redaction_override, &pane.ai_last_redactions, pane.ai_last_redacted_preview.as_deref(), pane.ai_selected_template);
                     let is_active = self
                         .layout
                         .get(self.active_tab)
@@ -2458,7 +2642,7 @@ impl Tant {
                         .into()
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
-                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None)
+                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None, None)
                 }
             }
             LayoutNode::Split { axis, ratio, left, right } => {
