@@ -83,6 +83,9 @@ pub struct Pane {
     pub ai_request_id: u64,
     pub history_scroll_id: scrollable::Id,
     pub highlighted_block: Option<usize>,
+    pub ai_redaction_override: bool,
+    pub ai_last_redactions: Vec<String>,
+    pub ai_last_redacted_preview: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -123,6 +126,31 @@ pub struct AiSettings {
     pub send_repo_context: bool,
     pub provider: String, // e.g., "openai", "anthropic"
     pub api_key: Option<String>,
+    pub redact_secrets: bool,
+    pub allow_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactionRuleConfig {
+    pub label: String,
+    pub pattern: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactionConfig {
+    pub rules: Vec<RedactionRuleConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct RedactionRule {
+    label: String,
+    regex: regex::Regex,
+}
+
+#[derive(Debug, Clone)]
+struct RedactionResult {
+    redacted: String,
+    matches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -226,6 +254,9 @@ impl Pane {
             ai_request_id: 0,
             history_scroll_id: scrollable::Id::unique(),
             highlighted_block: None,
+            ai_redaction_override: false,
+            ai_last_redactions: Vec::new(),
+            ai_last_redacted_preview: None,
         })
     }
 }
@@ -276,6 +307,10 @@ pub enum Message {
     AiPanelQuickAction(usize, AiQuickAction),
     AiPanelHoverCitation(usize, Option<usize>),
     AiPanelJumpToBlock(usize, usize),
+    AiPanelToggleRedactionOverride(usize, bool),
+    AiPanelReloadRedactionRules,
+    AiPanelOpenRedactionPreview(usize),
+    AiPanelCloseRedactionPreview(usize),
     ToggleAiEnabled,
     UpdateAiSettings(AiSettings),
     Paste(String),
@@ -410,6 +445,56 @@ fn resolve_host_info() -> HostInfo {
 }
 
 impl Tant {
+    fn default_redaction_rules() -> Vec<RedactionRule> {
+        let patterns = vec![
+            ("AWS Access Key", r"\bAKIA[0-9A-Z]{16}\b"),
+            ("AWS Secret Key", r"(?i)aws_secret_access_key\s*[:=]\s*[^\s]+"),
+            ("GitHub Token", r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
+            ("Bearer Token", r"(?i)bearer\s+[A-Za-z0-9\-\._~\+\/]+=*"),
+            ("Private Key Block", r"-----BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY-----[\s\S]+?-----END (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY-----"),
+        ];
+        patterns
+            .into_iter()
+            .filter_map(|(label, pattern)| {
+                regex::Regex::new(pattern).ok().map(|regex| RedactionRule { label: label.to_string(), regex })
+            })
+            .collect()
+    }
+
+    fn load_redaction_config(&self) -> RedactionConfig {
+        let path = std::path::Path::new("redaction_rules.json");
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            serde_json::from_str::<RedactionConfig>(&contents).unwrap_or(RedactionConfig { rules: Vec::new() })
+        } else {
+            RedactionConfig { rules: Vec::new() }
+        }
+    }
+
+    fn build_redaction_rules(&self) -> Vec<RedactionRule> {
+        let mut rules = Self::default_redaction_rules();
+        let config = self.load_redaction_config();
+        for rule in config.rules {
+            if let Ok(regex) = regex::Regex::new(&rule.pattern) {
+                rules.push(RedactionRule { label: rule.label, regex });
+            }
+        }
+        rules
+    }
+
+    fn redact_prompt(&self, input: &str) -> RedactionResult {
+        let rules = self.build_redaction_rules();
+        let mut redacted = input.to_string();
+        let mut matches = Vec::new();
+        for rule in rules {
+            if rule.regex.is_match(&redacted) {
+                matches.push(rule.label.clone());
+                redacted = rule.regex.replace_all(&redacted, "[REDACTED]").to_string();
+            }
+        }
+        matches.sort();
+        matches.dedup();
+        RedactionResult { redacted, matches }
+    }
     fn block_label(&self, index: usize, block: &Block) -> String {
         if let Some(started) = block.started_at {
             format!("block#{} ({})", index + 1, started.to_rfc3339())
@@ -1106,6 +1191,8 @@ impl Application for Tant {
             send_repo_context: false,
             provider: "ollama".to_string(),
             api_key: None,
+            redact_secrets: true,
+            allow_sensitive: false,
         };
         let theme_config = preset_theme("one_dark");
         (
@@ -1970,6 +2057,8 @@ impl Application for Tant {
                             content: String::new(),
                             sources,
                         };
+                        pane.ai_last_redactions.clear();
+                        pane.ai_last_redacted_preview = None;
                         pane.ai_chat.push(user_message);
                         pane.ai_chat.push(assistant);
                         pane.ai_stream_target = Some(pane.ai_chat.len().saturating_sub(1));
@@ -1981,7 +2070,19 @@ impl Application for Tant {
                     return Command::none();
                 };
 
-                let request = self.build_ai_prompt("respond", &user_text, &context);
+                let mut request = self.build_ai_prompt("respond", &user_text, &context);
+                if self.ai_settings.redact_secrets {
+                    let redacted = self.redact_prompt(&request.user);
+                    if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                        if let Some(pane) = tab.panes.get_mut(pane_id) {
+                            pane.ai_last_redactions = redacted.matches.clone();
+                            pane.ai_last_redacted_preview = Some(redacted.redacted.clone());
+                        }
+                    }
+                    if !self.ai_settings.allow_sensitive && !self.layout.get(self.active_tab).and_then(|tab| tab.panes.get(pane_id)).map(|pane| pane.ai_redaction_override).unwrap_or(false) {
+                        request.user = redacted.redacted;
+                    }
+                }
                 Command::perform(
                     async move { send_request(request).await },
                     move |result| match result {
@@ -1989,6 +2090,34 @@ impl Application for Tant {
                         Err(err) => Message::AiResponseReceived(pane_id, request_id, format!("AI error ({})", err)),
                     },
                 )
+            }
+            Message::AiPanelToggleRedactionOverride(pane_id, allow) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        pane.ai_redaction_override = allow;
+                    }
+                }
+                Command::none()
+            }
+            Message::AiPanelReloadRedactionRules => {
+                let _ = self.load_redaction_config();
+                Command::none()
+            }
+            Message::AiPanelOpenRedactionPreview(pane_id) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        pane.ai_redaction_override = true;
+                    }
+                }
+                Command::none()
+            }
+            Message::AiPanelCloseRedactionPreview(pane_id) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        pane.ai_redaction_override = false;
+                    }
+                }
+                Command::none()
             }
             Message::AiPanelStop(pane_id) => {
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
@@ -2238,7 +2367,7 @@ impl Application for Tant {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique())
+            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None)
         };
 
         if self.show_command_palette {
@@ -2303,7 +2432,7 @@ impl Tant {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
                     let ai_preview = self.resolve_context_preview(pane, pane.ai_context_scope);
-                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, pane.ai_panel_open, pane.ai_context_scope, &pane.ai_chat, &pane.ai_input, pane.ai_pending, pane.ai_streaming, ai_preview, pane.highlighted_block, pane.history_scroll_id.clone());
+                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, pane.ai_panel_open, pane.ai_context_scope, &pane.ai_chat, &pane.ai_input, pane.ai_pending, pane.ai_streaming, ai_preview, pane.highlighted_block, pane.history_scroll_id.clone(), pane.ai_redaction_override, &pane.ai_last_redactions, pane.ai_last_redacted_preview.as_deref());
                     let is_active = self
                         .layout
                         .get(self.active_tab)
@@ -2329,7 +2458,7 @@ impl Tant {
                         .into()
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
-                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique())
+                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None)
                 }
             }
             LayoutNode::Split { axis, ratio, left, right } => {

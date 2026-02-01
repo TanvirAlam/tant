@@ -1,0 +1,5 @@
+{
+  "rules": [
+    {"label": "Custom Example", "pattern": "(?i)password\\s*[:=]\\s*[^\\s]+"}
+  ]
+}

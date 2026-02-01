@@ -36,9 +36,20 @@ These are test cases intended for automation; they describe expected behavior an
 
 ### Streaming Response and Cancel
 1. Send a message and observe assistant response streaming in increments.
-   - **Expected:** Assistant message updates incrementally until complete.
+    - **Expected:** Assistant message updates incrementally until complete.
 2. While streaming, click "Stop".
-   - **Expected:** Streaming stops immediately and no further content is appended.
+    - **Expected:** Streaming stops immediately and no further content is appended.
+
+### Redaction Preview and Override
+1. Ensure `redaction_rules.json` contains a rule that matches output (e.g., a `password=secret` string).
+2. Send an AI request with context that includes the matching text.
+    - **Expected:** Redaction status shows the matched labels and the request uses `[REDACTED]` placeholders.
+3. Click "Show redacted preview".
+    - **Expected:** Preview appears with redacted placeholders.
+4. Toggle "Redaction enforced" to "Sending sensitive".
+    - **Expected:** Toggle changes state and subsequent send allows sensitive content.
+5. Click "Reload rules" after editing `redaction_rules.json`.
+    - **Expected:** New rules apply to the next request without restarting.
 
 ### Sources Display
 1. With context scope "Last N" or "Selected", send a message.
@@ -88,4 +99,12 @@ These are test cases intended for automation; they describe expected behavior an
 1. Execute two commands to create blocks.
 2. Use block selection checkboxes to select one block.
 3. Choose "Selected" scope and send a message.
-   - **Expected:** Sources show only the selected block label and the chip clicks back to that block.
+    - **Expected:** Sources show only the selected block label and the chip clicks back to that block.
+
+### Manual Redaction UI Verification
+1. With AI panel open, send a request that triggers redaction.
+    - **Expected:** "Redaction: ..." label lists matched rules.
+2. Click "Show redacted preview", then "Hide preview".
+    - **Expected:** Preview toggles visibility without affecting chat history.
+3. Toggle redaction override, then send another message.
+    - **Expected:** The override state persists for the pane and changes payload behavior.
