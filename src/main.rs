@@ -234,6 +234,12 @@ pub enum Message {
     RenameTabInput(String),
     CommitRenameTab,
     CancelRenameTab,
+    StartHistorySearch,
+    UpdateHistorySearch(String),
+    NextHistoryMatch,
+    PrevHistoryMatch,
+    ApplyHistoryMatch,
+    CancelHistorySearch,
     SwitchPane(isize),
     AdjustSplitRatio(Axis, f32),
     ExportTheme,
@@ -264,6 +270,10 @@ struct Tant {
     last_cursor_pos: Point,
     renaming_tab: Option<usize>,
     rename_buffer: String,
+    history_search_active: bool,
+    history_search_query: String,
+    history_matches: Vec<String>,
+    history_selected: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +331,36 @@ fn resolve_host_info() -> HostInfo {
 }
 
 impl Tant {
+    fn update_history_matches(&mut self) {
+        let query = self.history_search_query.to_lowercase();
+        let mut matches = Vec::new();
+        if let Some(tab) = self.layout.get(self.active_tab) {
+            for block in tab.panes.get(tab.active_pane).map(|p| &p.history).into_iter().flatten().rev() {
+                if query.is_empty() || block.command.to_lowercase().contains(&query) {
+                    matches.push(block.command.clone());
+                }
+                if matches.len() >= 10 {
+                    break;
+                }
+            }
+        }
+        self.history_matches = matches;
+        self.history_selected = 0;
+    }
+
+    fn apply_history_selection(&mut self) {
+        if let Some(selected) = self.history_matches.get(self.history_selected).cloned() {
+            if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                    pane.current_command = selected;
+                }
+            }
+        }
+        self.history_search_active = false;
+        self.history_search_query.clear();
+        self.history_matches.clear();
+        self.history_selected = 0;
+    }
     fn create_new_tab(&mut self) {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let home = std::env::var("HOME").ok();
@@ -912,7 +952,7 @@ impl Application for Tant {
             colors: HashMap::new(), // Will add defaults later
         };
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 }, renaming_tab: None, rename_buffer: String::new() },
+            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 }, renaming_tab: None, rename_buffer: String::new(), history_search_active: false, history_search_query: String::new(), history_matches: Vec::new(), history_selected: 0 },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -1038,6 +1078,12 @@ impl Application for Tant {
                 Command::none()
             }
             Message::TextInput(text) => {
+                if self.history_search_active {
+                    let next = format!("{}{}", self.history_search_query, text);
+                    self.history_search_query = next;
+                    self.update_history_matches();
+                    return Command::none();
+                }
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         if let Ok(mut pty) = pane.pty.try_lock() {
@@ -1100,6 +1146,38 @@ impl Application for Tant {
                 let is_cmd = modifiers.command();
                 let is_ctrl = modifiers.control();
                 let is_shift = modifiers.shift();
+
+                if is_ctrl && matches!(key, Key::Character(ref c) if c == "r") {
+                    return self.update(Message::StartHistorySearch);
+                }
+
+                if self.history_search_active {
+                    if matches!(key, Key::Named(iced::keyboard::key::Named::Escape)) {
+                        return self.update(Message::CancelHistorySearch);
+                    }
+                    if matches!(key, Key::Named(iced::keyboard::key::Named::ArrowDown)) {
+                        return self.update(Message::NextHistoryMatch);
+                    }
+                    if matches!(key, Key::Named(iced::keyboard::key::Named::ArrowUp)) {
+                        return self.update(Message::PrevHistoryMatch);
+                    }
+                    if matches!(key, Key::Named(iced::keyboard::key::Named::Enter)) {
+                        return self.update(Message::ApplyHistoryMatch);
+                    }
+                    if let Some(txt) = text.clone() {
+                        if !txt.is_empty() {
+                            let next = format!("{}{}", self.history_search_query, txt);
+                            return self.update(Message::UpdateHistorySearch(next));
+                        }
+                    }
+                    if matches!(key, Key::Named(iced::keyboard::key::Named::Backspace)) {
+                        if !self.history_search_query.is_empty() {
+                            let mut next = self.history_search_query.clone();
+                            next.pop();
+                            return self.update(Message::UpdateHistorySearch(next));
+                        }
+                    }
+                }
 
                 if matches!(key, Key::Character(ref c) if c == "t") {
                     if is_cmd || is_ctrl {
@@ -1212,6 +1290,10 @@ impl Application for Tant {
                     return self.update(Message::ClearSearch);
                 }
 
+                if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Space)) {
+                    return self.update(Message::TextInput(" ".to_string()));
+                }
+
                 if modifiers.control() || modifiers.alt() || modifiers.logo() {
                     return self.update(Message::KeyPress(key.clone(), modifiers));
                 }
@@ -1231,6 +1313,44 @@ impl Application for Tant {
                 }
 
                 self.update(Message::KeyPress(key.clone(), modifiers))
+            }
+            Message::StartHistorySearch => {
+                self.history_search_active = true;
+                self.history_search_query.clear();
+                self.update_history_matches();
+                Command::none()
+            }
+            Message::UpdateHistorySearch(query) => {
+                self.history_search_query = query;
+                self.update_history_matches();
+                Command::none()
+            }
+            Message::NextHistoryMatch => {
+                if !self.history_matches.is_empty() {
+                    self.history_selected = (self.history_selected + 1) % self.history_matches.len();
+                }
+                Command::none()
+            }
+            Message::PrevHistoryMatch => {
+                if !self.history_matches.is_empty() {
+                    if self.history_selected == 0 {
+                        self.history_selected = self.history_matches.len() - 1;
+                    } else {
+                        self.history_selected -= 1;
+                    }
+                }
+                Command::none()
+            }
+            Message::ApplyHistoryMatch => {
+                self.apply_history_selection();
+                Command::none()
+            }
+            Message::CancelHistorySearch => {
+                self.history_search_active = false;
+                self.history_search_query.clear();
+                self.history_matches.clear();
+                self.history_selected = 0;
+                Command::none()
             }
             Message::SplitPaneHorizontal => {
                 self.split_active_pane(Axis::Horizontal);
@@ -1767,7 +1887,7 @@ impl Application for Tant {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer)
+            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected)
         };
 
         if self.show_command_palette {
@@ -1831,7 +1951,7 @@ impl Tant {
         match node {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
-                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer);
+                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected);
                     let is_active = self
                         .layout
                         .get(self.active_tab)
@@ -1857,7 +1977,7 @@ impl Tant {
                         .into()
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
-                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer)
+                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected)
                 }
             }
             LayoutNode::Split { axis, ratio, left, right } => {

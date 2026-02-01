@@ -223,7 +223,7 @@ impl TerminalRenderer {
         (8.0, theme_config.line_height * theme_config.font_size)
     }
 
-    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str) -> Element<'a, Message> {
+    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize) -> Element<'a, Message> {
         // Use raw terminal mode for TUI apps (vim, top, etc.), block mode for normal shell
         if alt_screen_active {
             Canvas::new(TerminalCanvas {
@@ -239,11 +239,11 @@ impl TerminalRenderer {
             .height(Length::Fill)
             .into()
         } else {
-            self.render_blocks(history, current, current_command, search_query, search_success_only, search_failure_only, search_pinned_only, search_input_id, screen, theme_config, tabs, active_tab, renaming_tab, rename_buffer)
+            self.render_blocks(history, current, current_command, search_query, search_success_only, search_failure_only, search_pinned_only, search_input_id, screen, theme_config, tabs, active_tab, renaming_tab, rename_buffer, history_search_active, history_search_query, history_matches, history_selected)
         }
     }
 
-    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str) -> Element<'a, Message> {
+    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize) -> Element<'a, Message> {
         let mut column = Column::new().spacing(10).padding(theme_config.padding as u16);
 
         let live_screen_text = screen_to_text(screen);
@@ -342,6 +342,42 @@ impl TerminalRenderer {
         let scrollable = Scrollable::new(column)
             .width(Length::Fill)
             .height(Length::FillPortion(9));
+
+        let history_panel = if history_search_active {
+            let mut list = Column::new().spacing(4);
+            for (index, item) in history_matches.iter().enumerate() {
+                let color = if index == history_selected {
+                    Color::from_rgb(1.0, 0.85, 0.4)
+                } else {
+                    Color::from_rgb(0.8, 0.8, 0.8)
+                };
+                list = list.push(
+                    Text::new(item.clone())
+                        .font(Font::MONOSPACE)
+                        .size(theme_config.font_size - 2.0)
+                        .style(color),
+                );
+            }
+            let header = Text::new(format!("Reverse search: {}", history_search_query))
+                .font(Font::MONOSPACE)
+                .size(theme_config.font_size - 2.0)
+                .style(Color::from_rgb(0.7, 0.7, 0.7));
+            Some(
+                Container::new(Column::new().spacing(6).push(header).push(list))
+                    .padding(8)
+                    .style(|_theme: &Theme| container::Appearance {
+                        background: Some(Background::Color(Color::from_rgb(0.12, 0.12, 0.12))),
+                        border: Border {
+                            radius: 6.0.into(),
+                            width: 1.0,
+                            color: Color::from_rgb(0.25, 0.25, 0.25),
+                        },
+                        ..Default::default()
+                    }),
+            )
+        } else {
+            None
+        };
 
         // Command input area with better styling and increased height
         let input = TextInput::new("Type a command here...", current_command)
@@ -464,11 +500,14 @@ impl TerminalRenderer {
         .padding([6, 12, 0, 12]);
 
         // Input area with labels
-        let input_area = Column::new()
+        let mut input_area = Column::new()
             .push(prompt_row)
             .push(input_with_bg)
-            .push(Container::new(metadata_row).padding([5, 12, 8, 12]))
             .spacing(0);
+        if let Some(panel) = history_panel {
+            input_area = input_area.push(panel);
+        }
+        input_area = input_area.push(Container::new(metadata_row).padding([5, 12, 8, 12]));
 
         let input_container = Container::new(input_area)
             .width(Length::Fill)
