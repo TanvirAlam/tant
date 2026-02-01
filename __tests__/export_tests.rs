@@ -143,3 +143,39 @@ fn export_json_includes_optional_fields() {
     assert_eq!(first["is_remote"], true);
     assert_eq!(first["collapsed"], true);
 }
+
+#[test]
+fn export_markdown_empty_blocks_returns_empty_string() {
+    let result = format_blocks(&[], ExportFormat::Markdown).expect("markdown export");
+    assert!(result.content.is_empty());
+}
+
+#[test]
+fn export_text_multiple_blocks_includes_separators_for_each() {
+    let mut second = sample_block();
+    second.command = "pwd".to_string();
+    second.output = "/tmp".to_string();
+    let result = format_blocks(&[sample_block(), second], ExportFormat::Text).expect("text export");
+    let separator_count = result.content.matches("\n---\n").count();
+    assert_eq!(separator_count, 2);
+    assert!(result.content.contains("Command: echo hello"));
+    assert!(result.content.contains("Command: pwd"));
+}
+
+#[test]
+fn export_html_renders_all_blocks() {
+    let mut second = sample_block();
+    second.command = "uname -a".to_string();
+    let result = format_blocks(&[sample_block(), second], ExportFormat::Html).expect("html export");
+    let section_count = result.content.matches("<section class=\"block\">").count();
+    assert_eq!(section_count, 2);
+    assert!(result.content.contains("<h2>echo hello</h2>"));
+    assert!(result.content.contains("<h2>uname -a</h2>"));
+}
+
+#[test]
+fn export_json_empty_blocks_is_empty_array() {
+    let result = format_blocks(&[], ExportFormat::Json).expect("json export");
+    let parsed: serde_json::Value = serde_json::from_str(&result.content).expect("valid json");
+    assert_eq!(parsed, serde_json::json!([]));
+}

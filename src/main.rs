@@ -12,11 +12,13 @@ mod pty;
 mod parser;
 mod renderer;
 mod export;
+mod themes;
 mod ai;
 
 use parser::{TerminalParser, ParserEvent, GitStatus};
 use renderer::{TerminalRenderer, StyleRun};
 use export::{ExportFormat, format_blocks, write_export_file};
+use themes::preset_theme;
 use ai::{AiRequest, send_request};
 use pty::PtyManager;
 
@@ -956,14 +958,7 @@ impl Application for Tant {
             provider: "ollama".to_string(),
             api_key: None,
         };
-        let theme_config = ThemeConfig {
-            font_family: "Monospace".to_string(),
-            font_size: 16.0,
-            enable_ligatures: false,
-            padding: 15.0,
-            line_height: 1.2,
-            colors: HashMap::new(), // Will add defaults later
-        };
+        let theme_config = preset_theme("one_dark");
         (
             Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 }, renaming_tab: None, rename_buffer: String::new(), history_search_active: false, history_search_query: String::new(), history_matches: Vec::new(), history_selected: 0 },
             window::gain_focus(window::Id::MAIN)
