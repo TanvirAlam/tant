@@ -1,4 +1,4 @@
-use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse, clipboard, Point, Length, Color};
+use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse, clipboard, Point, Length, Color, Size, Rectangle, Border, Background};
 use iced::keyboard::{self, Key, Modifiers};
 use iced::widget::{Row, Column, container, TextInput, text_input};
 use log::{debug, info, warn, error};
@@ -109,7 +109,7 @@ pub struct AiSettings {
     pub api_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Axis {
     Horizontal,
     Vertical,
@@ -220,6 +220,11 @@ pub enum Message {
     UpdatePaletteQuery(String),
     UpdatePaletteSelection(isize),
     ExecutePaletteAction(PaletteAction),
+    SplitPaneHorizontal,
+    SplitPaneVertical,
+    ClosePane,
+    SwitchPane(isize),
+    AdjustSplitRatio(Axis, f32),
     ExportTheme,
     ImportTheme,
     None,
@@ -243,12 +248,27 @@ struct Tant {
     row_hashes: Arc<Mutex<HashMap<(usize, usize, u16), u64>>>,
     theme_config: ThemeConfig,
     host_info: HostInfo,
+    window_size: Size,
+    resize_state: Option<SplitResizeState>,
+    last_cursor_pos: Point,
 }
 
 #[derive(Debug, Clone)]
 struct HostInfo {
     display: String,
     is_remote: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SplitDirection {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone)]
+struct SplitResizeState {
+    path: Vec<SplitDirection>,
+    rect: Rectangle,
 }
 
 fn is_remote_session() -> bool {
@@ -288,6 +308,234 @@ fn resolve_host_info() -> HostInfo {
 }
 
 impl Tant {
+    fn remove_pane_from_layout(node: LayoutNode, pane_id: usize) -> Option<LayoutNode> {
+        match node {
+            LayoutNode::Leaf { pane_id: id } => {
+                if id == pane_id {
+                    None
+                } else {
+                    Some(LayoutNode::Leaf { pane_id: id })
+                }
+            }
+            LayoutNode::Split { axis, ratio, left, right } => {
+                let left = Self::remove_pane_from_layout(*left, pane_id);
+                let right = Self::remove_pane_from_layout(*right, pane_id);
+                match (left, right) {
+                    (None, None) => None,
+                    (Some(node), None) | (None, Some(node)) => Some(node),
+                    (Some(left), Some(right)) => Some(LayoutNode::Split {
+                        axis,
+                        ratio,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    }),
+                }
+            }
+        }
+    }
+
+    fn reindex_layout(node: &mut LayoutNode, removed_id: usize) {
+        match node {
+            LayoutNode::Leaf { pane_id } => {
+                if *pane_id > removed_id {
+                    *pane_id -= 1;
+                }
+            }
+            LayoutNode::Split { left, right, .. } => {
+                Self::reindex_layout(left, removed_id);
+                Self::reindex_layout(right, removed_id);
+            }
+        }
+    }
+
+    fn close_active_pane(&mut self) {
+        if let Some(tab) = self.layout.get_mut(self.active_tab) {
+            if tab.panes.len() <= 1 {
+                warn!("Cannot close the last pane in a tab");
+                return;
+            }
+
+            let active_id = tab.active_pane;
+            if let Some(pane) = tab.panes.get(active_id) {
+                if pane.current_block.as_ref().map(|b| b.exit_code.is_none()).unwrap_or(false) {
+                    warn!("Pane has a running command; close aborted");
+                    return;
+                }
+            }
+
+            tab.panes.remove(active_id);
+            let old_root = std::mem::replace(&mut tab.root, LayoutNode::Leaf { pane_id: 0 });
+            if let Some(new_root) = Self::remove_pane_from_layout(old_root, active_id) {
+                tab.root = new_root;
+            } else if !tab.panes.is_empty() {
+                tab.root = LayoutNode::Leaf { pane_id: 0 };
+            }
+            Self::reindex_layout(&mut tab.root, active_id);
+
+            if tab.panes.is_empty() {
+                tab.active_pane = 0;
+            } else if active_id > 0 {
+                tab.active_pane = active_id - 1;
+            } else {
+                tab.active_pane = 0;
+            }
+        }
+    }
+    fn split_layout_node(node: &mut LayoutNode, target_pane_id: usize, new_pane_id: usize, axis: Axis) -> bool {
+        match node {
+            LayoutNode::Leaf { pane_id } => {
+                if *pane_id == target_pane_id {
+                    *node = LayoutNode::Split {
+                        axis,
+                        ratio: 0.5,
+                        left: Box::new(LayoutNode::Leaf { pane_id: target_pane_id }),
+                        right: Box::new(LayoutNode::Leaf { pane_id: new_pane_id }),
+                    };
+                    true
+                } else {
+                    false
+                }
+            }
+            LayoutNode::Split { left, right, .. } => {
+                if Self::split_layout_node(left, target_pane_id, new_pane_id, axis) {
+                    return true;
+                }
+                Self::split_layout_node(right, target_pane_id, new_pane_id, axis)
+            }
+        }
+    }
+
+    fn contains_pane(node: &LayoutNode, pane_id: usize) -> bool {
+        match node {
+            LayoutNode::Leaf { pane_id: id } => *id == pane_id,
+            LayoutNode::Split { left, right, .. } => {
+                Self::contains_pane(left, pane_id) || Self::contains_pane(right, pane_id)
+            }
+        }
+    }
+
+    fn find_split_path_for_pane(node: &LayoutNode, pane_id: usize, axis: Axis, path: &mut Vec<SplitDirection>) -> Option<Vec<SplitDirection>> {
+        match node {
+            LayoutNode::Split { axis: node_axis, left, right, .. } => {
+                if *node_axis == axis && (Self::contains_pane(left, pane_id) || Self::contains_pane(right, pane_id)) {
+                    return Some(path.clone());
+                }
+                if Self::contains_pane(left, pane_id) {
+                    path.push(SplitDirection::Left);
+                    let found = Self::find_split_path_for_pane(left, pane_id, axis, path);
+                    path.pop();
+                    if found.is_some() {
+                        return found;
+                    }
+                }
+                if Self::contains_pane(right, pane_id) {
+                    path.push(SplitDirection::Right);
+                    let found = Self::find_split_path_for_pane(right, pane_id, axis, path);
+                    path.pop();
+                    return found;
+                }
+                None
+            }
+            LayoutNode::Leaf { .. } => None,
+        }
+    }
+
+    fn get_split_node_mut<'a>(node: &'a mut LayoutNode, path: &[SplitDirection]) -> Option<&'a mut LayoutNode> {
+        if path.is_empty() {
+            return Some(node);
+        }
+        match node {
+            LayoutNode::Split { left, right, .. } => match path[0] {
+                SplitDirection::Left => Self::get_split_node_mut(left, &path[1..]),
+                SplitDirection::Right => Self::get_split_node_mut(right, &path[1..]),
+            },
+            LayoutNode::Leaf { .. } => None,
+        }
+    }
+
+    fn split_active_pane(&mut self, axis: Axis) {
+        if let Some(tab) = self.layout.get_mut(self.active_tab) {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            let working_directory = tab
+                .panes
+                .get(tab.active_pane)
+                .map(|pane| pane.working_directory.clone());
+            let new_pane = match Pane::new(&shell, working_directory) {
+                Ok(pane) => pane,
+                Err(err) => {
+                    error!("Failed to create pane: {}", err);
+                    return;
+                }
+            };
+            let new_pane_id = tab.panes.len();
+            tab.panes.push(new_pane);
+            let replaced = Self::split_layout_node(&mut tab.root, tab.active_pane, new_pane_id, axis);
+            if replaced {
+                tab.active_pane = new_pane_id;
+            } else {
+                error!("Failed to split pane: active pane not found in layout");
+            }
+        }
+    }
+
+    fn find_split_hit(node: &LayoutNode, rect: Rectangle, position: Point, threshold: f32, path: &mut Vec<SplitDirection>) -> Option<SplitResizeState> {
+        match node {
+            LayoutNode::Split { axis, ratio, left, right } => {
+                let (left_rect, right_rect, divider_rect) = match axis {
+                    Axis::Horizontal => {
+                        let divider_x = rect.x + rect.width * ratio;
+                        let left_rect = Rectangle { x: rect.x, y: rect.y, width: rect.width * ratio, height: rect.height };
+                        let right_rect = Rectangle { x: divider_x, y: rect.y, width: rect.width - rect.width * ratio, height: rect.height };
+                        let divider_rect = Rectangle { x: divider_x - threshold, y: rect.y, width: threshold * 2.0, height: rect.height };
+                        (left_rect, right_rect, divider_rect)
+                    }
+                    Axis::Vertical => {
+                        let divider_y = rect.y + rect.height * ratio;
+                        let left_rect = Rectangle { x: rect.x, y: rect.y, width: rect.width, height: rect.height * ratio };
+                        let right_rect = Rectangle { x: rect.x, y: divider_y, width: rect.width, height: rect.height - rect.height * ratio };
+                        let divider_rect = Rectangle { x: rect.x, y: divider_y - threshold, width: rect.width, height: threshold * 2.0 };
+                        (left_rect, right_rect, divider_rect)
+                    }
+                };
+
+                if divider_rect.contains(position) {
+                    return Some(SplitResizeState { path: path.clone(), rect });
+                }
+
+                if left_rect.contains(position) {
+                    path.push(SplitDirection::Left);
+                    let found = Self::find_split_hit(left, left_rect, position, threshold, path);
+                    path.pop();
+                    if found.is_some() {
+                        return found;
+                    }
+                }
+
+                if right_rect.contains(position) {
+                    path.push(SplitDirection::Right);
+                    let found = Self::find_split_hit(right, right_rect, position, threshold, path);
+                    path.pop();
+                    return found;
+                }
+
+                None
+            }
+            LayoutNode::Leaf { .. } => None,
+        }
+    }
+
+    fn update_split_ratio(node: &mut LayoutNode, state: &SplitResizeState, position: Point) {
+        if let Some(target) = Self::get_split_node_mut(node, &state.path) {
+            if let LayoutNode::Split { axis, ratio, .. } = target {
+                let new_ratio = match axis {
+                    Axis::Horizontal => ((position.x - state.rect.x) / state.rect.width).clamp(0.1, 0.9),
+                    Axis::Vertical => ((position.y - state.rect.y) / state.rect.height).clamp(0.1, 0.9),
+                };
+                *ratio = new_ratio;
+            }
+        }
+    }
+
     fn key_to_bytes(key: &Key, modifiers: &Modifiers) -> Vec<u8> {
         match key {
             Key::Named(named_key) => {
@@ -421,16 +669,13 @@ impl Tant {
     fn execute_palette_action(&mut self, action: PaletteAction) {
         match action {
             PaletteAction::SplitPaneHorizontal => {
-                // TODO: Implement split pane
-                warn!("Split pane horizontal is not implemented yet");
+                self.split_active_pane(Axis::Horizontal);
             }
             PaletteAction::SplitPaneVertical => {
-                // TODO: Implement split pane
-                warn!("Split pane vertical is not implemented yet");
+                self.split_active_pane(Axis::Vertical);
             }
             PaletteAction::ClosePane => {
-                // TODO: Implement close pane
-                warn!("Close pane is not implemented yet");
+                self.close_active_pane();
             }
             PaletteAction::SwitchTab(index) => {
                 if index < self.layout.len() {
@@ -442,9 +687,16 @@ impl Tant {
                     if let Some(pane) = tab.panes.get(tab.active_pane) {
                         if let Some(block) = pane.history.get(index) {
                             if block.pinned {
-                                let _cmd = format!("{}\n", block.command);
-                                // TODO: Send to current pane
-                                info!("Run pinned command: {}", block.command);
+                                if let Ok(mut pty) = pane.pty.try_lock() {
+                                    let cmd = format!("{}\r", block.command);
+                                    if let Err(err) = pty.writer().write_all(cmd.as_bytes()) {
+                                        error!("Failed to write to PTY: {}", err);
+                                    }
+                                    if let Err(err) = pty.writer().flush() {
+                                        error!("Failed to flush PTY writer: {}", err);
+                                    }
+                                    info!("Run pinned command: {}", block.command);
+                                }
                             }
                         }
                     }
@@ -584,7 +836,7 @@ impl Application for Tant {
             colors: HashMap::new(), // Will add defaults later
         };
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info() },
+            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 } },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -747,6 +999,7 @@ impl Application for Tant {
                 Command::none()
             }
             Message::Resize(width, height) => {
+                self.window_size = Size::new(width as f32, height as f32);
                 let (cell_w, cell_h) = self.renderer.cell_size(&self.theme_config);
                 let cols = (width as f32 / cell_w) as u16;
                 let rows = (height as f32 / cell_h) as u16;
@@ -765,6 +1018,41 @@ impl Application for Tant {
                 // Clear render caches on resize
                 self.render_cache.lock().unwrap().clear();
                 self.row_hashes.lock().unwrap().clear();
+                Command::none()
+            }
+            Message::SplitPaneHorizontal => {
+                self.split_active_pane(Axis::Horizontal);
+                Command::none()
+            }
+            Message::SplitPaneVertical => {
+                self.split_active_pane(Axis::Vertical);
+                Command::none()
+            }
+            Message::ClosePane => {
+                self.close_active_pane();
+                Command::none()
+            }
+            Message::SwitchPane(delta) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if !tab.panes.is_empty() {
+                        let len = tab.panes.len() as isize;
+                        let next = (tab.active_pane as isize + delta).rem_euclid(len) as usize;
+                        tab.active_pane = next;
+                    }
+                }
+                Command::none()
+            }
+            Message::AdjustSplitRatio(axis, delta) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    let mut path = Vec::new();
+                    if let Some(target_path) = Self::find_split_path_for_pane(&tab.root, tab.active_pane, axis, &mut path) {
+                        if let Some(target) = Self::get_split_node_mut(&mut tab.root, &target_path) {
+                            if let LayoutNode::Split { ratio, .. } = target {
+                                *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                            }
+                        }
+                    }
+                }
                 Command::none()
             }
             Message::UpdateCommand(index, new_cmd) => {
@@ -1080,6 +1368,18 @@ impl Application for Tant {
             Message::MouseButtonPressed(button) => {
                 if button == mouse::Button::Left {
                     if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                        let rect = Rectangle {
+                            x: 0.0,
+                            y: 0.0,
+                            width: self.window_size.width,
+                            height: self.window_size.height,
+                        };
+                        let mut path = Vec::new();
+                        if let Some(state) = Self::find_split_hit(&tab.root, rect, self.last_cursor_pos, 6.0, &mut path) {
+                            self.resize_state = Some(state);
+                            return Command::none();
+                        }
+
                         if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                             pane.mouse_button_down = true;
                             let cell_w = self.renderer.cell_size(&self.theme_config).0;
@@ -1094,7 +1394,12 @@ impl Application for Tant {
                 Command::none()
             }
             Message::MouseCursorMoved(position) => {
+                self.last_cursor_pos = position;
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(state) = self.resize_state.clone() {
+                        Self::update_split_ratio(&mut tab.root, &state, position);
+                        return Command::none();
+                    }
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                         pane.last_cursor_pos = position;
                         if pane.mouse_button_down {
@@ -1110,6 +1415,7 @@ impl Application for Tant {
             }
             Message::MouseButtonReleased(button) => {
                 if button == mouse::Button::Left {
+                    self.resize_state = None;
                     if let Some(tab) = self.layout.get_mut(self.active_tab) {
                         if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
                             pane.mouse_button_down = false;
@@ -1250,6 +1556,61 @@ impl Application for Tant {
                     Message::MouseButtonReleased(button)
                 }
                 iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
+                    let is_cmd = modifiers.command();
+                    let is_ctrl = modifiers.control();
+                    let is_shift = modifiers.shift();
+
+                    if matches!(key, Key::Character(ref c) if c == "d") {
+                        if is_cmd && !is_shift {
+                            return Message::SplitPaneHorizontal;
+                        }
+                        if is_cmd && is_shift {
+                            return Message::SplitPaneVertical;
+                        }
+                        if is_ctrl && is_shift {
+                            return Message::SplitPaneHorizontal;
+                        }
+                        if is_ctrl && !is_shift {
+                            return Message::SplitPaneVertical;
+                        }
+                    }
+
+                    if matches!(key, Key::Character(ref c) if c == "w") {
+                        if is_cmd {
+                            return Message::ClosePane;
+                        }
+                        if is_ctrl && is_shift {
+                            return Message::ClosePane;
+                        }
+                    }
+
+                    if is_cmd && matches!(key, Key::Character(ref c) if c == "[") {
+                        return Message::SwitchPane(-1);
+                    }
+                    if is_cmd && matches!(key, Key::Character(ref c) if c == "]") {
+                        return Message::SwitchPane(1);
+                    }
+
+                    if is_ctrl && modifiers.alt() {
+                        match key {
+                            Key::Named(iced::keyboard::key::Named::ArrowLeft) => return Message::SwitchPane(-1),
+                            Key::Named(iced::keyboard::key::Named::ArrowRight) => return Message::SwitchPane(1),
+                            Key::Named(iced::keyboard::key::Named::ArrowUp) => return Message::SwitchPane(-1),
+                            Key::Named(iced::keyboard::key::Named::ArrowDown) => return Message::SwitchPane(1),
+                            _ => {}
+                        }
+                    }
+
+                    if is_cmd && is_ctrl {
+                        match key {
+                            Key::Named(iced::keyboard::key::Named::ArrowLeft) => return Message::AdjustSplitRatio(Axis::Horizontal, -0.05),
+                            Key::Named(iced::keyboard::key::Named::ArrowRight) => return Message::AdjustSplitRatio(Axis::Horizontal, 0.05),
+                            Key::Named(iced::keyboard::key::Named::ArrowUp) => return Message::AdjustSplitRatio(Axis::Vertical, -0.05),
+                            Key::Named(iced::keyboard::key::Named::ArrowDown) => return Message::AdjustSplitRatio(Axis::Vertical, 0.05),
+                            _ => {}
+                        }
+                    }
+
                     // Check for command palette shortcut (Ctrl+K)
                     if modifiers.control() && matches!(key, iced::keyboard::Key::Character(ref c) if c == "k") {
                         return Message::OpenCommandPalette;
@@ -1300,7 +1661,30 @@ impl Tant {
         match node {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
-                    self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config)
+                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config);
+                    let is_active = self
+                        .layout
+                        .get(self.active_tab)
+                        .map(|tab| tab.active_pane == *pane_id)
+                        .unwrap_or(false);
+                    let border_color = if is_active {
+                        Color::from_rgb(0.45, 0.75, 1.0)
+                    } else {
+                        Color::from_rgb(0.2, 0.2, 0.2)
+                    };
+                    container(view)
+                        .style(move |_theme: &Theme| container::Appearance {
+                            background: Some(Background::Color(Color::from_rgb(0.11, 0.11, 0.11))),
+                            border: Border {
+                                color: border_color,
+                                width: if is_active { 2.0 } else { 1.0 },
+                                radius: 6.0.into(),
+                            },
+                            ..Default::default()
+                        })
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
                     self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config)
