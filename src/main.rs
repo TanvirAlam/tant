@@ -12,10 +12,12 @@ mod pty;
 mod parser;
 mod renderer;
 mod export;
+mod ai;
 
 use parser::{TerminalParser, ParserEvent, GitStatus};
 use renderer::{TerminalRenderer, StyleRun};
 use export::{ExportFormat, format_blocks, write_export_file};
+use ai::{AiRequest, send_request};
 use pty::PtyManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -771,14 +773,25 @@ impl Tant {
     }
 
 
-    fn call_ai(&self, prompt: &str, action: &str) -> String {
-        // Mock AI response
-        match action {
-            "explain_error" => format!("AI Explanation: Based on the output, this error seems to be related to...\n\n{}", prompt),
-            "suggest_fix" => format!("AI Suggestion: Try running the following command to fix the issue:\n\n```bash\nsome_fix_command\n```\n\n{}", prompt),
-            "generate_command" => format!("AI Generated Command: Based on your request, try:\n\n```bash\ngenerated_command\n```\n\n{}", prompt),
-            "summarize_output" => format!("AI Summary: The output shows...\n\n{}", prompt),
-            _ => format!("AI Response: {}\n\n{}", action, prompt),
+    fn build_ai_request(&self, prompt: &str, action: &str) -> AiRequest {
+        let system = match action {
+            "explain_error" => "Explain the error and likely cause in concise terms.",
+            "suggest_fix" => "Suggest a practical fix and a command to try.",
+            "generate_command" => "Generate a command for the user's request.",
+            "summarize_output" => "Summarize the command output briefly.",
+            _ => "Respond concisely.",
+        };
+        let model = match self.ai_settings.provider.as_str() {
+            "openai" => "gpt-4o-mini",
+            "anthropic" => "claude-3-5-sonnet-20240620",
+            "ollama" => "llama3.2:latest",
+            _ => "gpt-4o-mini",
+        };
+        AiRequest {
+            provider: self.ai_settings.provider.clone(),
+            model: model.to_string(),
+            system: system.to_string(),
+            user: prompt.to_string(),
         }
     }
 
@@ -936,11 +949,11 @@ impl Application for Tant {
         };
         let renderer = TerminalRenderer::new();
         let ai_settings = AiSettings {
-            enabled: false,
-            send_current_command: false,
+            enabled: true,
+            send_current_command: true,
             send_last_n_blocks: 5,
             send_repo_context: false,
-            provider: "mock".to_string(),
+            provider: "ollama".to_string(),
             api_key: None,
         };
         let theme_config = ThemeConfig {
@@ -1635,36 +1648,63 @@ impl Application for Tant {
             Message::AiExplainError => {
                 if self.ai_settings.enabled {
                     let data = self.collect_ai_data(true, self.ai_settings.send_last_n_blocks);
-                    let response = self.call_ai(&data, "explain_error");
-                    self.ai_response = Some(response);
+                    let request = self.build_ai_request(&data, "explain_error");
+                    return Command::perform(
+                        async move { send_request(request).await },
+                        move |result| match result {
+                            Ok(resp) => Message::AiResponse(resp.content),
+                            Err(err) => Message::AiResponse(format!("AI error ({})", err)),
+                        },
+                    );
                 }
                 Command::none()
             }
             Message::AiSuggestFix => {
                 if self.ai_settings.enabled {
                     let data = self.collect_ai_data(true, self.ai_settings.send_last_n_blocks);
-                    let response = self.call_ai(&data, "suggest_fix");
-                    self.ai_response = Some(response);
+                    let request = self.build_ai_request(&data, "suggest_fix");
+                    return Command::perform(
+                        async move { send_request(request).await },
+                        move |result| match result {
+                            Ok(resp) => Message::AiResponse(resp.content),
+                            Err(err) => Message::AiResponse(format!("AI error ({})", err)),
+                        },
+                    );
                 }
                 Command::none()
             }
             Message::AiGenerateCommand => {
                 if self.ai_settings.enabled {
                     let data = self.collect_ai_data(false, 0);
-                    let response = self.call_ai(&data, "generate_command");
-                    self.ai_response = Some(response);
+                    let request = self.build_ai_request(&data, "generate_command");
+                    return Command::perform(
+                        async move { send_request(request).await },
+                        move |result| match result {
+                            Ok(resp) => Message::AiResponse(resp.content),
+                            Err(err) => Message::AiResponse(format!("AI error ({})", err)),
+                        },
+                    );
                 }
                 Command::none()
             }
             Message::AiSummarizeOutput => {
                 if self.ai_settings.enabled {
                     let data = self.collect_ai_data(false, self.ai_settings.send_last_n_blocks);
-                    let response = self.call_ai(&data, "summarize_output");
-                    self.ai_response = Some(response);
+                    let request = self.build_ai_request(&data, "summarize_output");
+                    return Command::perform(
+                        async move { send_request(request).await },
+                        move |result| match result {
+                            Ok(resp) => Message::AiResponse(resp.content),
+                            Err(err) => Message::AiResponse(format!("AI error ({})", err)),
+                        },
+                    );
                 }
                 Command::none()
             }
-            Message::AiResponse(_) => Command::none(),
+            Message::AiResponse(response) => {
+                self.ai_response = Some(response);
+                Command::none()
+            }
             Message::ToggleAiEnabled => {
                 self.ai_settings.enabled = !self.ai_settings.enabled;
                 Command::none()
