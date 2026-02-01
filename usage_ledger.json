@@ -1,0 +1,13 @@
+{
+  "entries": [
+    {
+      "timestamp": "2026-02-01T22:16:10.402763Z",
+      "request_chars": 244,
+      "response_chars": 243,
+      "duration_ms": 5568,
+      "provider": "ollama",
+      "model": "llama3.2:latest"
+    }
+  ],
+  "last_reset": "2026-02-01T22:15:22.826596Z"
+}

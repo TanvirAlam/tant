@@ -81,6 +81,10 @@ pub struct Pane {
     pub ai_stream_remaining: String,
     pub ai_stream_target: Option<usize>,
     pub ai_request_id: u64,
+    pub ai_request_started_at: Option<DateTime<Utc>>,
+    pub ai_request_chars: usize,
+    pub ai_request_provider: Option<String>,
+    pub ai_request_model: Option<String>,
     pub history_scroll_id: scrollable::Id,
     pub highlighted_block: Option<usize>,
     pub ai_redaction_override: bool,
@@ -131,22 +135,75 @@ pub struct AiSettings {
     pub allow_sensitive: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanTier {
+    Free,
+    Pro,
+    Team,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanLimits {
+    pub daily_messages: u32,
+    pub daily_chars: u32,
+    pub max_context_chars: usize,
+    pub allow_streaming: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BillingProfile {
+    pub plan: PlanTier,
+    pub customer_id: Option<String>,
+    pub subscription_id: Option<String>,
+    pub renewal_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub ai_onboarding_seen: bool,
     #[serde(default = "default_ai_share_link_enabled")]
     pub ai_share_link_enabled: bool,
+    #[serde(default = "default_plan_tier")]
+    pub plan_tier: PlanTier,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { ai_onboarding_seen: false, ai_share_link_enabled: true }
+        Self { ai_onboarding_seen: false, ai_share_link_enabled: true, plan_tier: PlanTier::Free }
     }
 }
 
 fn default_ai_share_link_enabled() -> bool {
     true
+}
+
+fn default_plan_tier() -> PlanTier {
+    PlanTier::Free
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageEntry {
+    pub timestamp: DateTime<Utc>,
+    pub request_chars: usize,
+    pub response_chars: usize,
+    pub duration_ms: u64,
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageLedger {
+    pub entries: Vec<UsageEntry>,
+    pub last_reset: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageSnapshot {
+    pub used_messages: u32,
+    pub used_chars: u32,
+    pub remaining_messages: u32,
+    pub remaining_chars: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +336,7 @@ pub enum PaletteAction {
     ApplyAiTemplate(AiPromptTemplateId),
     ExportTheme,
     ImportTheme,
+    OpenBilling,
     // Add more as needed
 }
 
@@ -326,6 +384,10 @@ impl Pane {
             ai_stream_remaining: String::new(),
             ai_stream_target: None,
             ai_request_id: 0,
+            ai_request_started_at: None,
+            ai_request_chars: 0,
+            ai_request_provider: None,
+            ai_request_model: None,
             history_scroll_id: scrollable::Id::unique(),
             highlighted_block: None,
             ai_redaction_override: false,
@@ -431,6 +493,11 @@ pub enum Message {
     AdjustSplitRatio(Axis, f32),
     ExportTheme,
     ImportTheme,
+    OpenBilling,
+    CloseBilling,
+    BillingUpgradeRequested,
+    BillingPlanSelected(PlanTier),
+    BillingSyncRequested,
     None,
 }
 
@@ -464,6 +531,10 @@ struct Tant {
     history_matches: Vec<String>,
     history_selected: usize,
     export_toast: Option<ExportToast>,
+    usage_ledger: UsageLedger,
+    billing_profile: BillingProfile,
+    usage_snapshot: UsageSnapshot,
+    show_billing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -676,7 +747,16 @@ impl Tant {
             }
         }
 
-        let char_count = context.chars().count();
+        let limits = Self::plan_limits(self.billing_profile.plan);
+        let mut char_count = context.chars().count();
+        if char_count > limits.max_context_chars {
+            context = context
+                .chars()
+                .take(limits.max_context_chars)
+                .collect::<String>();
+            context.push_str("\n\n[context truncated for plan limits]\n");
+            char_count = context.chars().count();
+        }
         let token_estimate = (char_count / 4).max(1);
         let block_count = sources.iter().filter(|item| item.block_index.is_some()).count();
         let preview = AiContextPreview { block_count, char_count, token_estimate };
@@ -1218,6 +1298,80 @@ impl Tant {
         Ok(())
     }
 
+    fn plan_limits(plan: PlanTier) -> PlanLimits {
+        match plan {
+            PlanTier::Free => PlanLimits {
+                daily_messages: 50,
+                daily_chars: 20_000,
+                max_context_chars: 6_000,
+                allow_streaming: false,
+            },
+            PlanTier::Pro => PlanLimits {
+                daily_messages: 500,
+                daily_chars: 200_000,
+                max_context_chars: 24_000,
+                allow_streaming: true,
+            },
+            PlanTier::Team => PlanLimits {
+                daily_messages: 2_000,
+                daily_chars: 1_000_000,
+                max_context_chars: 64_000,
+                allow_streaming: true,
+            },
+        }
+    }
+
+    fn usage_ledger_path() -> &'static str {
+        "usage_ledger.json"
+    }
+
+    fn load_usage_ledger() -> UsageLedger {
+        let path = std::path::Path::new(Self::usage_ledger_path());
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            serde_json::from_str::<UsageLedger>(&contents).unwrap_or_else(|_| UsageLedger {
+                entries: Vec::new(),
+                last_reset: Utc::now(),
+            })
+        } else {
+            UsageLedger { entries: Vec::new(), last_reset: Utc::now() }
+        }
+    }
+
+    fn save_usage_ledger(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let json = serde_json::to_string_pretty(&self.usage_ledger)?;
+        std::fs::write(Self::usage_ledger_path(), json)?;
+        Ok(())
+    }
+
+
+    fn reset_usage_if_needed(&mut self) {
+        let now = Utc::now();
+        if now.date_naive() != self.usage_ledger.last_reset.date_naive() {
+            self.usage_ledger.entries.clear();
+            self.usage_ledger.last_reset = now;
+        }
+    }
+
+    fn compute_usage_snapshot(&self, limits: &PlanLimits) -> UsageSnapshot {
+        let used_messages = self.usage_ledger.entries.len() as u32;
+        let used_chars = self
+            .usage_ledger
+            .entries
+            .iter()
+            .map(|entry| entry.request_chars as u32 + entry.response_chars as u32)
+            .sum::<u32>();
+        UsageSnapshot {
+            used_messages,
+            used_chars,
+            remaining_messages: limits.daily_messages.saturating_sub(used_messages),
+            remaining_chars: limits.daily_chars.saturating_sub(used_chars),
+        }
+    }
+
+    fn can_send_ai_request(&self) -> bool {
+        self.usage_snapshot.remaining_messages > 0 && self.usage_snapshot.remaining_chars > 0 && self.ai_settings.enabled
+    }
+
     fn build_ai_prompt(&self, action: &str, user_text: &str, context: &str) -> AiRequest {
         let system = match action {
             "explain_error" => "Explain the error and likely cause in concise terms.",
@@ -1320,6 +1474,9 @@ impl Tant {
                     error!("Failed to import theme: {}", e);
                 }
             }
+            PaletteAction::OpenBilling => {
+                self.show_billing = true;
+            }
         }
     }
 
@@ -1355,6 +1512,63 @@ impl Tant {
             .center_y()
             .width(Length::Fixed(400.0))
             .height(Length::Fixed(300.0))
+            .into()
+    }
+
+    fn render_billing(&self) -> Element<Message> {
+        let limits = Self::plan_limits(self.billing_profile.plan);
+        let plan_label = match self.billing_profile.plan {
+            PlanTier::Free => "Free",
+            PlanTier::Pro => "Pro",
+            PlanTier::Team => "Team",
+        };
+        let usage = Column::new()
+            .spacing(6)
+            .push(iced::widget::Text::new(format!(
+                "Usage today: {} / {} messages",
+                self.usage_snapshot.used_messages, limits.daily_messages
+            )))
+            .push(iced::widget::Text::new(format!(
+                "Usage today: {} / {} chars",
+                self.usage_snapshot.used_chars, limits.daily_chars
+            )))
+            .push(iced::widget::Text::new(format!(
+                "Streaming: {}",
+                if limits.allow_streaming { "enabled" } else { "disabled" }
+            )));
+        let plan_buttons = Row::new()
+            .spacing(8)
+            .push(iced::widget::Button::new(iced::widget::Text::new("Free")).on_press(Message::BillingPlanSelected(PlanTier::Free)))
+            .push(iced::widget::Button::new(iced::widget::Text::new("Pro")).on_press(Message::BillingPlanSelected(PlanTier::Pro)))
+            .push(iced::widget::Button::new(iced::widget::Text::new("Team")).on_press(Message::BillingPlanSelected(PlanTier::Team)));
+        let actions = Row::new()
+            .spacing(8)
+            .push(iced::widget::Button::new(iced::widget::Text::new("Upgrade")).on_press(Message::BillingUpgradeRequested))
+            .push(iced::widget::Button::new(iced::widget::Text::new("Sync billing")).on_press(Message::BillingSyncRequested))
+            .push(iced::widget::Button::new(iced::widget::Text::new("Close")).on_press(Message::CloseBilling));
+        let content = Column::new()
+            .spacing(10)
+            .push(iced::widget::Text::new("Billing").size(18.0))
+            .push(iced::widget::Text::new(format!("Current plan: {}", plan_label)))
+            .push(usage)
+            .push(iced::widget::Text::new("Select plan:"))
+            .push(plan_buttons)
+            .push(actions)
+            .padding(20);
+        container(content)
+            .center_x()
+            .center_y()
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &Theme| container::Appearance {
+                background: Some(Background::Color(Color::from_rgb(0.08, 0.09, 0.11))),
+                border: Border {
+                    radius: 8.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.2, 0.2, 0.2),
+                },
+                ..Default::default()
+            })
             .into()
     }
 
@@ -1406,6 +1620,7 @@ impl Tant {
             ("Close Pane", PaletteAction::ClosePane),
             ("Toggle AI", PaletteAction::ToggleAi),
             ("Toggle AI Panel", PaletteAction::ToggleAiPanel),
+            ("Open Billing", PaletteAction::OpenBilling),
             ("AI Template: Explain error", PaletteAction::ApplyAiTemplate(AiPromptTemplateId::ExplainError)),
             ("AI Template: Debug command", PaletteAction::ApplyAiTemplate(AiPromptTemplateId::DebugCommand)),
             ("AI Template: Summarize output", PaletteAction::ApplyAiTemplate(AiPromptTemplateId::SummarizeOutput)),
@@ -1477,6 +1692,37 @@ impl Application for Tant {
         let renderer = TerminalRenderer::new();
         let app_config = Self::load_app_config();
         let ai_onboarding_open = !app_config.ai_onboarding_seen;
+        let usage_ledger = Self::load_usage_ledger();
+        let billing_profile = BillingProfile {
+            plan: app_config.plan_tier,
+            customer_id: None,
+            subscription_id: None,
+            renewal_at: None,
+        };
+        let plan_limits = Self::plan_limits(billing_profile.plan);
+        let usage_snapshot = {
+            let mut ledger = usage_ledger.clone();
+            if Utc::now().date_naive() != ledger.last_reset.date_naive() {
+                ledger.entries.clear();
+                ledger.last_reset = Utc::now();
+            }
+            UsageSnapshot {
+                used_messages: ledger.entries.len() as u32,
+                used_chars: ledger
+                    .entries
+                    .iter()
+                    .map(|entry| entry.request_chars as u32 + entry.response_chars as u32)
+                    .sum::<u32>(),
+                remaining_messages: plan_limits.daily_messages.saturating_sub(ledger.entries.len() as u32),
+                remaining_chars: plan_limits.daily_chars.saturating_sub(
+                    ledger
+                        .entries
+                        .iter()
+                        .map(|entry| entry.request_chars as u32 + entry.response_chars as u32)
+                        .sum::<u32>(),
+                ),
+            }
+        };
         let ai_settings = AiSettings {
             enabled: true,
             send_current_command: true,
@@ -1489,7 +1735,7 @@ impl Application for Tant {
         };
         let theme_config = preset_theme("one_dark");
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, app_config, ai_onboarding_open, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 }, renaming_tab: None, rename_buffer: String::new(), history_search_active: false, history_search_query: String::new(), history_matches: Vec::new(), history_selected: 0, export_toast: None },
+            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, app_config, ai_onboarding_open, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 }, renaming_tab: None, rename_buffer: String::new(), history_search_active: false, history_search_query: String::new(), history_matches: Vec::new(), history_selected: 0, export_toast: None, usage_ledger, billing_profile, usage_snapshot, show_billing: false },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -1501,9 +1747,18 @@ impl Application for Tant {
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::Tick => {
+                self.reset_usage_if_needed();
+                let limits = Self::plan_limits(self.billing_profile.plan);
+                self.usage_snapshot = self.compute_usage_snapshot(&limits);
+                self.ai_settings.send_last_n_blocks = self.ai_settings.send_last_n_blocks.min(limits.max_context_chars / 1000).max(1);
                 for tab in &mut self.layout {
                     for pane in &mut tab.panes {
                         if pane.ai_streaming {
+                            if !limits.allow_streaming {
+                                pane.ai_streaming = false;
+                                pane.ai_stream_remaining.clear();
+                                pane.ai_stream_target = None;
+                            }
                             if let Some(target) = pane.ai_stream_target {
                                 if let Some(message) = pane.ai_chat.get_mut(target) {
                                     if !pane.ai_stream_remaining.is_empty() {
@@ -2356,7 +2611,7 @@ impl Application for Tant {
                 Command::none()
             }
             Message::AiPanelSend(pane_id) => {
-                if !self.ai_settings.enabled {
+                if !self.can_send_ai_request() {
                     return Command::none();
                 }
 
@@ -2406,6 +2661,7 @@ impl Application for Tant {
                 };
 
                 let mut request = self.build_ai_prompt("respond", &user_text, &context);
+                let request_chars = request.user.chars().count();
                 if self.ai_settings.redact_secrets {
                     let redacted = self.redact_prompt(&request.user);
                     if let Some(tab) = self.layout.get_mut(self.active_tab) {
@@ -2416,6 +2672,14 @@ impl Application for Tant {
                     }
                     if !self.ai_settings.allow_sensitive && !self.layout.get(self.active_tab).and_then(|tab| tab.panes.get(pane_id)).map(|pane| pane.ai_redaction_override).unwrap_or(false) {
                         request.user = redacted.redacted;
+                    }
+                }
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        pane.ai_request_started_at = Some(Utc::now());
+                        pane.ai_request_chars = request_chars;
+                        pane.ai_request_provider = Some(request.provider.clone());
+                        pane.ai_request_model = Some(request.model.clone());
                     }
                 }
                 Command::perform(
@@ -2471,6 +2735,22 @@ impl Application for Tant {
                         if pane.ai_request_id == request_id {
                             pane.ai_pending = false;
                             pane.ai_stream_remaining = response;
+                            let duration_ms = pane
+                                .ai_request_started_at
+                                .map(|started| (Utc::now() - started).num_milliseconds().max(0) as u64)
+                                .unwrap_or(0);
+                            let entry = UsageEntry {
+                                timestamp: Utc::now(),
+                                request_chars: pane.ai_request_chars,
+                                response_chars: pane.ai_stream_remaining.chars().count(),
+                                duration_ms,
+                                provider: pane.ai_request_provider.clone().unwrap_or_else(|| "unknown".to_string()),
+                                model: pane.ai_request_model.clone().unwrap_or_else(|| "unknown".to_string()),
+                            };
+                            self.usage_ledger.entries.push(entry);
+                            let _ = self.save_usage_ledger();
+                            let limits = Self::plan_limits(self.billing_profile.plan);
+                            self.usage_snapshot = self.compute_usage_snapshot(&limits);
                         }
                     }
                 }
@@ -2693,6 +2973,36 @@ impl Application for Tant {
                 }
                 Command::none()
             }
+            Message::OpenBilling => {
+                self.show_billing = true;
+                Command::none()
+            }
+            Message::CloseBilling => {
+                self.show_billing = false;
+                Command::none()
+            }
+            Message::BillingUpgradeRequested => {
+                self.export_toast = Some(ExportToast {
+                    message: "Upgrade flow stubbed: connect Stripe integration later.".to_string(),
+                    expires_at: Utc::now() + chrono::Duration::seconds(6),
+                });
+                Command::none()
+            }
+            Message::BillingPlanSelected(plan) => {
+                self.billing_profile.plan = plan;
+                self.app_config.plan_tier = plan;
+                let limits = Self::plan_limits(plan);
+                self.usage_snapshot = self.compute_usage_snapshot(&limits);
+                let _ = self.save_app_config();
+                Command::none()
+            }
+            Message::BillingSyncRequested => {
+                self.export_toast = Some(ExportToast {
+                    message: "Billing sync stubbed: webhook integration pending.".to_string(),
+                    expires_at: Utc::now() + chrono::Duration::seconds(6),
+                });
+                Command::none()
+            }
             Message::PtyData(_) | Message::ParserEvents(_) | Message::None => Command::none(),
         }
     }
@@ -2702,11 +3012,13 @@ impl Application for Tant {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None, None, self.export_toast.as_ref())
+            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None, None, self.export_toast.as_ref(), self.billing_profile.plan, Self::plan_limits(self.billing_profile.plan), self.usage_snapshot.clone())
         };
 
         if self.ai_onboarding_open {
             self.render_ai_onboarding()
+        } else if self.show_billing {
+            self.render_billing()
         } else if self.show_command_palette {
             self.render_command_palette()
         } else {
@@ -2769,7 +3081,7 @@ impl Tant {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
                     let ai_preview = self.resolve_context_preview(pane, pane.ai_context_scope);
-                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, pane.ai_panel_open, pane.ai_context_scope, &pane.ai_chat, &pane.ai_input, pane.ai_pending, pane.ai_streaming, ai_preview, pane.highlighted_block, pane.history_scroll_id.clone(), pane.ai_redaction_override, &pane.ai_last_redactions, pane.ai_last_redacted_preview.as_deref(), pane.ai_selected_template, self.export_toast.as_ref());
+                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, pane.ai_panel_open, pane.ai_context_scope, &pane.ai_chat, &pane.ai_input, pane.ai_pending, pane.ai_streaming, ai_preview, pane.highlighted_block, pane.history_scroll_id.clone(), pane.ai_redaction_override, &pane.ai_last_redactions, pane.ai_last_redacted_preview.as_deref(), pane.ai_selected_template, self.export_toast.as_ref(), self.billing_profile.plan, Self::plan_limits(self.billing_profile.plan), self.usage_snapshot.clone());
                     let is_active = self
                         .layout
                         .get(self.active_tab)
@@ -2795,7 +3107,7 @@ impl Tant {
                         .into()
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
-                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None, None, self.export_toast.as_ref())
+                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None, None, self.export_toast.as_ref(), self.billing_profile.plan, Self::plan_limits(self.billing_profile.plan), self.usage_snapshot.clone())
                 }
             }
             LayoutNode::Split { axis, ratio, left, right } => {
