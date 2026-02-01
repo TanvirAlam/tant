@@ -149,6 +149,31 @@ fn screen_to_text(screen: &vt100::Screen) -> String {
     out
 }
 
+fn last_non_empty_line(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.to_string())
+}
+
+fn strip_prompt_line(output: &str, prompt_line: &str) -> String {
+    if prompt_line.trim().is_empty() {
+        return output.to_string();
+    }
+    let mut lines: Vec<&str> = output.lines().collect();
+    while let Some(last) = lines.last() {
+        if last.trim().is_empty() {
+            lines.pop();
+            continue;
+        }
+        if last.trim_end() == prompt_line.trim_end() {
+            lines.pop();
+        }
+        break;
+    }
+    lines.join("\n")
+}
+
 fn color_to_iced(color: vt100::Color) -> Color {
     match color {
         vt100::Color::Rgb(r, g, b) => Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
@@ -221,6 +246,9 @@ impl TerminalRenderer {
     fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
         let mut column = Column::new().spacing(10).padding(theme_config.padding as u16);
 
+        let live_screen_text = screen_to_text(screen);
+        let prompt_line = last_non_empty_line(&live_screen_text).unwrap_or_default();
+
         let mut match_count = 0usize;
         let mut filtered_blocks: Vec<(usize, &Block, MatchRanges)> = vec![];
         for (index, block) in history.iter().enumerate() {
@@ -286,13 +314,12 @@ impl TerminalRenderer {
 
         // Show live screen text if no history yet (so prompts are visible)
         if history.is_empty() && current.is_none() {
-            let screen_text = screen_to_text(screen);
-            if screen_text.trim().is_empty() {
+            if live_screen_text.trim().is_empty() {
                 let welcome = Text::new("Welcome to Tant Terminal\n\nType a command below and press Enter to get started.")
                     .size(14.0);
                 column = column.push(welcome);
             } else {
-                let live_output = Text::new(screen_text)
+                let live_output = Text::new(live_screen_text.clone())
                     .font(Font::MONOSPACE)
                     .size(theme_config.font_size - 2.0);
                 column = column.push(live_output);
@@ -301,7 +328,7 @@ impl TerminalRenderer {
 
         // Render history blocks
         for (index, block, ranges) in filtered_blocks {
-            let block_widget = self.render_block(block, index, theme_config, search_query, ranges);
+            let block_widget = self.render_block(block, index, theme_config, search_query, ranges, &prompt_line);
             column = column.push(block_widget);
         }
 
@@ -417,8 +444,27 @@ impl TerminalRenderer {
             .spacing(3);
         metadata_row = metadata_row.push(host_label);
 
+        let prompt_color = match current.as_ref().and_then(|block| block.exit_code) {
+            Some(0) => Color::from_rgb(0.2, 0.8, 0.4),
+            Some(_) => Color::from_rgb(0.9, 0.35, 0.35),
+            None => Color::from_rgb(0.6, 0.8, 1.0),
+        };
+        let prompt_text = if prompt_line.trim().is_empty() {
+            "❯".to_string()
+        } else {
+            prompt_line.to_string()
+        };
+        let prompt_row = Container::new(
+            Text::new(prompt_text)
+                .font(Font::MONOSPACE)
+                .size(theme_config.font_size)
+                .style(prompt_color),
+        )
+        .padding([6, 12, 0, 12]);
+
         // Input area with labels
         let input_area = Column::new()
+            .push(prompt_row)
             .push(input_with_bg)
             .push(Container::new(metadata_row).padding([5, 12, 8, 12]))
             .spacing(0);
@@ -436,7 +482,7 @@ impl TerminalRenderer {
             .into()
     }
 
-    fn render_block<'a>(&self, block: &'a Block, index: usize, theme_config: &'a ThemeConfig, search_query: &'a str, ranges: MatchRanges) -> Element<'a, Message> {
+    fn render_block<'a>(&self, block: &'a Block, index: usize, theme_config: &'a ThemeConfig, search_query: &'a str, ranges: MatchRanges, prompt_line: &str) -> Element<'a, Message> {
         let (status_display, status_color) = match block.exit_code {
             Some(0) => ("Success".to_string(), Color::from_rgb(0.25, 0.8, 0.4)),
             Some(code) => (format!("Exit {}", code), Color::from_rgb(0.9, 0.35, 0.35)),
@@ -521,12 +567,13 @@ impl TerminalRenderer {
             .padding([10, 12]);
 
         if !block.collapsed && !block.output.is_empty() {
+            let output = strip_prompt_line(&block.output, prompt_line);
             let output_color = if ranges.output && !search_query.trim().is_empty() {
                 Color::from_rgb(1.0, 0.9, 0.55)
             } else {
                 Color::from_rgb(0.85, 0.85, 0.85)
             };
-            let output_text = Text::new(&block.output)
+            let output_text = Text::new(output)
                 .font(Font::MONOSPACE)
                 .size(theme_config.font_size - 3.0)
                 .style(output_color);
