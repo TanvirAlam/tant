@@ -8,7 +8,7 @@ use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
 use vt100;
 use chrono::Utc;
-use crate::{Message, AiSettings, Block, ThemeConfig};
+use crate::{Message, AiSettings, Block, ThemeConfig, Tab};
 use crate::export::ExportFormat;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher, DefaultHasher};
@@ -223,7 +223,7 @@ impl TerminalRenderer {
         (8.0, theme_config.line_height * theme_config.font_size)
     }
 
-    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
+    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str) -> Element<'a, Message> {
         // Use raw terminal mode for TUI apps (vim, top, etc.), block mode for normal shell
         if alt_screen_active {
             Canvas::new(TerminalCanvas {
@@ -239,11 +239,11 @@ impl TerminalRenderer {
             .height(Length::Fill)
             .into()
         } else {
-            self.render_blocks(history, current, current_command, search_query, search_success_only, search_failure_only, search_pinned_only, search_input_id, screen, theme_config)
+            self.render_blocks(history, current, current_command, search_query, search_success_only, search_failure_only, search_pinned_only, search_input_id, screen, theme_config, tabs, active_tab, renaming_tab, rename_buffer)
         }
     }
 
-    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
+    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str) -> Element<'a, Message> {
         let mut column = Column::new().spacing(10).padding(theme_config.padding as u16);
 
         let live_screen_text = screen_to_text(screen);
@@ -310,7 +310,8 @@ impl TerminalRenderer {
             .spacing(8)
             .align_items(Alignment::Center);
 
-        column = column.push(search_row);
+        let tab_bar = self.render_tab_bar(tabs, active_tab, renaming_tab, rename_buffer, theme_config);
+        column = column.push(tab_bar).push(search_row);
 
         // Show live screen text if no history yet (so prompts are visible)
         if history.is_empty() && current.is_none() {
@@ -479,6 +480,73 @@ impl TerminalRenderer {
             .push(input_container)
             .height(Length::Fill)
             .spacing(0)
+            .into()
+    }
+
+    fn render_tab_bar<'a>(&self, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, _theme_config: &'a ThemeConfig) -> Element<'a, Message> {
+        let mut row = Row::new().spacing(6).align_items(Alignment::Center);
+        for (index, tab) in tabs.iter().enumerate() {
+            let is_active = index == active_tab;
+            let title_widget: Element<'a, Message> = if renaming_tab == Some(index) {
+                TextInput::new("Tab name", rename_buffer)
+                    .on_input(Message::RenameTabInput)
+                    .on_submit(Message::CommitRenameTab)
+                    .size(12.0)
+                    .padding(6)
+                    .into()
+            } else {
+                let title_text = Text::new(tab.title.clone())
+                    .font(Font::MONOSPACE)
+                    .size(12.0)
+                    .style(if is_active { Color::WHITE } else { Color::from_rgb(0.7, 0.7, 0.7) });
+                Button::new(title_text)
+                    .on_press(Message::SelectTab(index))
+                    .padding([4, 8])
+                    .into()
+            };
+
+            let close_button = Button::new(Text::new("×").size(12.0))
+                .on_press(Message::CloseTabAt(index))
+                .padding([2, 6]);
+
+            let tab_chip = Row::new()
+                .push(title_widget)
+                .push(close_button)
+                .spacing(4)
+                .align_items(Alignment::Center);
+
+            let tab_container = Container::new(tab_chip)
+                .padding([4, 6])
+                .style(move |_theme: &Theme| container::Appearance {
+                    background: Some(Background::Color(if is_active { Color::from_rgb(0.2, 0.2, 0.2) } else { Color::from_rgb(0.12, 0.12, 0.12) })),
+                    border: Border {
+                        radius: 6.0.into(),
+                        width: 1.0,
+                        color: if is_active { Color::from_rgb(0.45, 0.75, 1.0) } else { Color::from_rgb(0.2, 0.2, 0.2) },
+                    },
+                    ..Default::default()
+                });
+            row = row.push(tab_container);
+        }
+
+        row = row.push(
+            Button::new(Text::new("+").size(14.0))
+                .on_press(Message::NewTab)
+                .padding([4, 8]),
+        );
+
+        Container::new(row)
+            .padding([6, 8])
+            .style(|_theme: &Theme| container::Appearance {
+                background: Some(Background::Color(Color::from_rgb(0.1, 0.1, 0.1))),
+                border: Border {
+                    radius: 8.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.18, 0.18, 0.18),
+                },
+                ..Default::default()
+            })
+            .width(Length::Fill)
             .into()
     }
 

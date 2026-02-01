@@ -172,6 +172,7 @@ impl Pane {
 pub enum Message {
     Tick,
     KeyPress(Key, Modifiers),
+    KeyboardEvent(Key, Modifiers, Option<String>),
     TextInput(String),
     PtyData(Vec<u8>),
     Resize(u32, u32),
@@ -223,6 +224,16 @@ pub enum Message {
     SplitPaneHorizontal,
     SplitPaneVertical,
     ClosePane,
+    NewTab,
+    CloseTab,
+    CloseTabAt(usize),
+    SelectTab(usize),
+    PrevTab,
+    NextTab,
+    BeginRenameTab(usize),
+    RenameTabInput(String),
+    CommitRenameTab,
+    CancelRenameTab,
     SwitchPane(isize),
     AdjustSplitRatio(Axis, f32),
     ExportTheme,
@@ -251,6 +262,8 @@ struct Tant {
     window_size: Size,
     resize_state: Option<SplitResizeState>,
     last_cursor_pos: Point,
+    renaming_tab: Option<usize>,
+    rename_buffer: String,
 }
 
 #[derive(Debug, Clone)]
@@ -308,6 +321,69 @@ fn resolve_host_info() -> HostInfo {
 }
 
 impl Tant {
+    fn create_new_tab(&mut self) {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let home = std::env::var("HOME").ok();
+        let pane = match Pane::new(&shell, home) {
+            Ok(pane) => pane,
+            Err(err) => {
+                error!("Failed to create pane for new tab: {}", err);
+                return;
+            }
+        };
+        let title = format!("Tab {}", self.layout.len() + 1);
+        let tab = Tab { root: LayoutNode::Leaf { pane_id: 0 }, panes: vec![pane], active_pane: 0, title };
+        self.layout.push(tab);
+        self.active_tab = self.layout.len().saturating_sub(1);
+        self.render_cache.lock().unwrap().clear();
+        self.row_hashes.lock().unwrap().clear();
+    }
+
+    fn close_tab_at(&mut self, index: usize) {
+        if self.layout.len() <= 1 {
+            warn!("Cannot close the last tab");
+            return;
+        }
+        if let Some(tab) = self.layout.get(index) {
+            let has_running = tab.panes.iter().any(|pane| {
+                pane.current_block.as_ref().map(|b| b.exit_code.is_none()).unwrap_or(false)
+            });
+            if has_running {
+                warn!("Tab has running commands; close aborted");
+                return;
+            }
+        }
+
+        if index < self.layout.len() {
+            self.layout.remove(index);
+            if self.active_tab >= self.layout.len() {
+                self.active_tab = self.layout.len().saturating_sub(1);
+            } else if self.active_tab > index {
+                self.active_tab = self.active_tab.saturating_sub(1);
+            }
+            self.render_cache.lock().unwrap().clear();
+            self.row_hashes.lock().unwrap().clear();
+        }
+    }
+
+    fn begin_rename_tab(&mut self, index: usize) {
+        if let Some(tab) = self.layout.get(index) {
+            self.renaming_tab = Some(index);
+            self.rename_buffer = tab.title.clone();
+        }
+    }
+
+    fn commit_rename_tab(&mut self) {
+        if let Some(index) = self.renaming_tab.take() {
+            if let Some(tab) = self.layout.get_mut(index) {
+                let trimmed = self.rename_buffer.trim();
+                if !trimmed.is_empty() {
+                    tab.title = trimmed.to_string();
+                }
+            }
+        }
+        self.rename_buffer.clear();
+    }
     fn remove_pane_from_layout(node: LayoutNode, pane_id: usize) -> Option<LayoutNode> {
         match node {
             LayoutNode::Leaf { pane_id: id } => {
@@ -836,7 +912,7 @@ impl Application for Tant {
             colors: HashMap::new(), // Will add defaults later
         };
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 } },
+            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 }, renaming_tab: None, rename_buffer: String::new() },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -1020,6 +1096,142 @@ impl Application for Tant {
                 self.row_hashes.lock().unwrap().clear();
                 Command::none()
             }
+            Message::KeyboardEvent(key, modifiers, text) => {
+                let is_cmd = modifiers.command();
+                let is_ctrl = modifiers.control();
+                let is_shift = modifiers.shift();
+
+                if matches!(key, Key::Character(ref c) if c == "t") {
+                    if is_cmd || is_ctrl {
+                        return self.update(Message::NewTab);
+                    }
+                }
+
+                if matches!(key, Key::Character(ref c) if c == "q") {
+                    if is_ctrl && is_shift {
+                        return self.update(Message::CloseTab);
+                    }
+                }
+
+                if matches!(key, Key::Character(ref c) if c == "d") {
+                    if is_cmd && !is_shift {
+                        return self.update(Message::SplitPaneHorizontal);
+                    }
+                    if is_cmd && is_shift {
+                        return self.update(Message::SplitPaneVertical);
+                    }
+                    if is_ctrl && is_shift {
+                        return self.update(Message::SplitPaneHorizontal);
+                    }
+                    if is_ctrl && !is_shift {
+                        return self.update(Message::SplitPaneVertical);
+                    }
+                }
+
+                if matches!(key, Key::Character(ref c) if c == "w") {
+                    if is_cmd {
+                        if let Some(tab) = self.layout.get(self.active_tab) {
+                            if tab.panes.len() > 1 {
+                                return self.update(Message::ClosePane);
+                            }
+                        }
+                        return self.update(Message::CloseTab);
+                    }
+                    if is_ctrl && is_shift {
+                        return self.update(Message::ClosePane);
+                    }
+                }
+
+                if matches!(key, Key::Character(ref c) if c == "r") {
+                    if is_cmd && is_shift {
+                        let index = self.active_tab;
+                        return self.update(Message::BeginRenameTab(index));
+                    }
+                }
+
+                if is_cmd {
+                    if let Key::Character(ref c) = key {
+                        if let Ok(num) = c.parse::<usize>() {
+                            if num >= 1 && num <= 9 {
+                                let index = num - 1;
+                                return self.update(Message::SelectTab(index));
+                            }
+                        }
+                    }
+                }
+
+                if is_cmd && matches!(key, Key::Character(ref c) if c == "[") {
+                    return self.update(Message::PrevTab);
+                }
+                if is_cmd && matches!(key, Key::Character(ref c) if c == "]") {
+                    return self.update(Message::NextTab);
+                }
+
+                if matches!(key, Key::Named(iced::keyboard::key::Named::Escape)) {
+                    if self.renaming_tab.is_some() {
+                        return self.update(Message::CancelRenameTab);
+                    }
+                }
+
+                if is_cmd && matches!(key, Key::Character(ref c) if c == "[") {
+                    return self.update(Message::SwitchPane(-1));
+                }
+                if is_cmd && matches!(key, Key::Character(ref c) if c == "]") {
+                    return self.update(Message::SwitchPane(1));
+                }
+
+                if is_ctrl && modifiers.alt() {
+                    match key {
+                        Key::Named(iced::keyboard::key::Named::ArrowLeft) => return self.update(Message::SwitchPane(-1)),
+                        Key::Named(iced::keyboard::key::Named::ArrowRight) => return self.update(Message::SwitchPane(1)),
+                        Key::Named(iced::keyboard::key::Named::ArrowUp) => return self.update(Message::SwitchPane(-1)),
+                        Key::Named(iced::keyboard::key::Named::ArrowDown) => return self.update(Message::SwitchPane(1)),
+                        _ => {}
+                    }
+                }
+
+                if is_cmd && is_ctrl {
+                    match key {
+                        Key::Named(iced::keyboard::key::Named::ArrowLeft) => return self.update(Message::AdjustSplitRatio(Axis::Horizontal, -0.05)),
+                        Key::Named(iced::keyboard::key::Named::ArrowRight) => return self.update(Message::AdjustSplitRatio(Axis::Horizontal, 0.05)),
+                        Key::Named(iced::keyboard::key::Named::ArrowUp) => return self.update(Message::AdjustSplitRatio(Axis::Vertical, -0.05)),
+                        Key::Named(iced::keyboard::key::Named::ArrowDown) => return self.update(Message::AdjustSplitRatio(Axis::Vertical, 0.05)),
+                        _ => {}
+                    }
+                }
+
+                if modifiers.control() && matches!(key, iced::keyboard::Key::Character(ref c) if c == "k") {
+                    return self.update(Message::OpenCommandPalette);
+                }
+
+                if (modifiers.command() || modifiers.control()) && matches!(key, iced::keyboard::Key::Character(ref c) if c == "f") {
+                    return self.update(Message::FocusSearch);
+                }
+
+                if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
+                    return self.update(Message::ClearSearch);
+                }
+
+                if modifiers.control() || modifiers.alt() || modifiers.logo() {
+                    return self.update(Message::KeyPress(key.clone(), modifiers));
+                }
+
+                if matches!(key, iced::keyboard::Key::Named(_)) {
+                    return self.update(Message::KeyPress(key.clone(), modifiers));
+                }
+
+                if let Some(txt) = text {
+                    if !txt.is_empty() {
+                        return self.update(Message::TextInput(txt));
+                    }
+                }
+
+                if matches!(&key, iced::keyboard::Key::Character(c) if c == " ") {
+                    return self.update(Message::TextInput(" ".to_string()));
+                }
+
+                self.update(Message::KeyPress(key.clone(), modifiers))
+            }
             Message::SplitPaneHorizontal => {
                 self.split_active_pane(Axis::Horizontal);
                 Command::none()
@@ -1030,6 +1242,55 @@ impl Application for Tant {
             }
             Message::ClosePane => {
                 self.close_active_pane();
+                Command::none()
+            }
+            Message::NewTab => {
+                self.create_new_tab();
+                Command::none()
+            }
+            Message::CloseTab => {
+                self.close_tab_at(self.active_tab);
+                Command::none()
+            }
+            Message::CloseTabAt(index) => {
+                self.close_tab_at(index);
+                Command::none()
+            }
+            Message::SelectTab(index) => {
+                if index < self.layout.len() {
+                    self.active_tab = index;
+                }
+                Command::none()
+            }
+            Message::PrevTab => {
+                if !self.layout.is_empty() {
+                    let len = self.layout.len() as isize;
+                    self.active_tab = ((self.active_tab as isize - 1).rem_euclid(len)) as usize;
+                }
+                Command::none()
+            }
+            Message::NextTab => {
+                if !self.layout.is_empty() {
+                    let len = self.layout.len() as isize;
+                    self.active_tab = ((self.active_tab as isize + 1).rem_euclid(len)) as usize;
+                }
+                Command::none()
+            }
+            Message::BeginRenameTab(index) => {
+                self.begin_rename_tab(index);
+                Command::none()
+            }
+            Message::RenameTabInput(value) => {
+                self.rename_buffer = value;
+                Command::none()
+            }
+            Message::CommitRenameTab => {
+                self.commit_rename_tab();
+                Command::none()
+            }
+            Message::CancelRenameTab => {
+                self.renaming_tab = None;
+                self.rename_buffer.clear();
                 Command::none()
             }
             Message::SwitchPane(delta) => {
@@ -1506,7 +1767,7 @@ impl Application for Tant {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config)
+            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer)
         };
 
         if self.show_command_palette {
@@ -1556,98 +1817,7 @@ impl Application for Tant {
                     Message::MouseButtonReleased(button)
                 }
                 iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. }) => {
-                    let is_cmd = modifiers.command();
-                    let is_ctrl = modifiers.control();
-                    let is_shift = modifiers.shift();
-
-                    if matches!(key, Key::Character(ref c) if c == "d") {
-                        if is_cmd && !is_shift {
-                            return Message::SplitPaneHorizontal;
-                        }
-                        if is_cmd && is_shift {
-                            return Message::SplitPaneVertical;
-                        }
-                        if is_ctrl && is_shift {
-                            return Message::SplitPaneHorizontal;
-                        }
-                        if is_ctrl && !is_shift {
-                            return Message::SplitPaneVertical;
-                        }
-                    }
-
-                    if matches!(key, Key::Character(ref c) if c == "w") {
-                        if is_cmd {
-                            return Message::ClosePane;
-                        }
-                        if is_ctrl && is_shift {
-                            return Message::ClosePane;
-                        }
-                    }
-
-                    if is_cmd && matches!(key, Key::Character(ref c) if c == "[") {
-                        return Message::SwitchPane(-1);
-                    }
-                    if is_cmd && matches!(key, Key::Character(ref c) if c == "]") {
-                        return Message::SwitchPane(1);
-                    }
-
-                    if is_ctrl && modifiers.alt() {
-                        match key {
-                            Key::Named(iced::keyboard::key::Named::ArrowLeft) => return Message::SwitchPane(-1),
-                            Key::Named(iced::keyboard::key::Named::ArrowRight) => return Message::SwitchPane(1),
-                            Key::Named(iced::keyboard::key::Named::ArrowUp) => return Message::SwitchPane(-1),
-                            Key::Named(iced::keyboard::key::Named::ArrowDown) => return Message::SwitchPane(1),
-                            _ => {}
-                        }
-                    }
-
-                    if is_cmd && is_ctrl {
-                        match key {
-                            Key::Named(iced::keyboard::key::Named::ArrowLeft) => return Message::AdjustSplitRatio(Axis::Horizontal, -0.05),
-                            Key::Named(iced::keyboard::key::Named::ArrowRight) => return Message::AdjustSplitRatio(Axis::Horizontal, 0.05),
-                            Key::Named(iced::keyboard::key::Named::ArrowUp) => return Message::AdjustSplitRatio(Axis::Vertical, -0.05),
-                            Key::Named(iced::keyboard::key::Named::ArrowDown) => return Message::AdjustSplitRatio(Axis::Vertical, 0.05),
-                            _ => {}
-                        }
-                    }
-
-                    // Check for command palette shortcut (Ctrl+K)
-                    if modifiers.control() && matches!(key, iced::keyboard::Key::Character(ref c) if c == "k") {
-                        return Message::OpenCommandPalette;
-                    }
-
-                    if (modifiers.command() || modifiers.control()) && matches!(key, iced::keyboard::Key::Character(ref c) if c == "f") {
-                        return Message::FocusSearch;
-                    }
-
-                    if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
-                        return Message::ClearSearch;
-                    }
-
-                    // Handle special keys and modifiers first
-                    if modifiers.control() || modifiers.alt() || modifiers.logo() {
-                        return Message::KeyPress(key.clone(), modifiers);
-                    }
-
-                    // Check if it's a named key (arrows, enter, etc.) but NOT Space
-                    if matches!(key, iced::keyboard::Key::Named(_)) {
-                        return Message::KeyPress(key.clone(), modifiers);
-                    }
-
-                    // For regular characters (including space), prefer text field if available
-                    if let Some(txt) = text {
-                        if !txt.is_empty() {
-                            return Message::TextInput(txt.to_string());
-                        }
-                    }
-
-                    // Special handling for space if text is empty
-                    if matches!(&key, iced::keyboard::Key::Character(c) if c == " ") {
-                        return Message::TextInput(" ".to_string());
-                    }
-
-                    // Fallback to key press
-                    Message::KeyPress(key.clone(), modifiers)
+                    Message::KeyboardEvent(key, modifiers, text.map(|value| value.to_string()))
                 }
                 _ => Message::None,
             }
@@ -1661,7 +1831,7 @@ impl Tant {
         match node {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
-                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config);
+                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer);
                     let is_active = self
                         .layout
                         .get(self.active_tab)
@@ -1687,7 +1857,7 @@ impl Tant {
                         .into()
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
-                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config)
+                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer)
                 }
             }
             LayoutNode::Split { axis, ratio, left, right } => {
