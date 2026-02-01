@@ -8,7 +8,7 @@ use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
 use vt100;
 use chrono::Utc;
-use crate::{Message, AiSettings, Block, ThemeConfig, Tab, AiChatMessage, AiChatRole, AiContextScope, AiQuickAction, AiContextPreview, AI_PROMPT_TEMPLATES, AiPromptTemplateId};
+use crate::{ExportToast, Message, AiSettings, Block, ThemeConfig, Tab, AiChatMessage, AiChatRole, AiContextScope, AiQuickAction, AiContextPreview, AI_PROMPT_TEMPLATES, AiPromptTemplateId};
 use crate::export::ExportFormat;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher, DefaultHasher};
@@ -223,7 +223,7 @@ impl TerminalRenderer {
         (8.0, theme_config.line_height * theme_config.font_size)
     }
 
-    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, alt_screen_active: bool, ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize, ai_panel_open: bool, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, ai_preview: AiContextPreview, highlighted_block: Option<usize>, history_scroll_id: scrollable::Id, ai_redaction_override: bool, ai_last_redactions: &'a [String], ai_last_redacted_preview: Option<&'a str>, ai_selected_template: Option<AiPromptTemplateId>) -> Element<'a, Message> {
+    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, alt_screen_active: bool, ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize, ai_panel_open: bool, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, ai_preview: AiContextPreview, highlighted_block: Option<usize>, history_scroll_id: scrollable::Id, ai_redaction_override: bool, ai_last_redactions: &'a [String], ai_last_redacted_preview: Option<&'a str>, ai_selected_template: Option<AiPromptTemplateId>, export_toast: Option<&'a ExportToast>) -> Element<'a, Message> {
         // Use raw terminal mode for TUI apps (vim, top, etc.), block mode for normal shell
         if alt_screen_active {
             let canvas = Canvas::new(TerminalCanvas {
@@ -249,11 +249,11 @@ impl TerminalRenderer {
                 canvas.into()
             }
         } else {
-            self.render_blocks(history, current, current_command, search_query, search_success_only, search_failure_only, search_pinned_only, search_input_id, screen, theme_config, tabs, active_tab, renaming_tab, rename_buffer, history_search_active, history_search_query, history_matches, history_selected, ai_panel_open, ai_context_scope, ai_chat, ai_input, ai_pending, ai_streaming, pane_id, highlighted_block, ai_preview, history_scroll_id, ai_settings, ai_redaction_override, ai_last_redactions, ai_last_redacted_preview, ai_selected_template)
+            self.render_blocks(history, current, current_command, search_query, search_success_only, search_failure_only, search_pinned_only, search_input_id, screen, theme_config, tabs, active_tab, renaming_tab, rename_buffer, history_search_active, history_search_query, history_matches, history_selected, ai_panel_open, ai_context_scope, ai_chat, ai_input, ai_pending, ai_streaming, pane_id, highlighted_block, ai_preview, history_scroll_id, ai_settings, ai_redaction_override, ai_last_redactions, ai_last_redacted_preview, ai_selected_template, export_toast)
         }
     }
 
-    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize, ai_panel_open: bool, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, pane_id: usize, highlighted_block: Option<usize>, ai_preview: AiContextPreview, history_scroll_id: scrollable::Id, ai_settings: &'a AiSettings, ai_redaction_override: bool, ai_last_redactions: &'a [String], ai_last_redacted_preview: Option<&'a str>, ai_selected_template: Option<AiPromptTemplateId>) -> Element<'a, Message> {
+    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize, ai_panel_open: bool, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, pane_id: usize, highlighted_block: Option<usize>, ai_preview: AiContextPreview, history_scroll_id: scrollable::Id, ai_settings: &'a AiSettings, ai_redaction_override: bool, ai_last_redactions: &'a [String], ai_last_redacted_preview: Option<&'a str>, ai_selected_template: Option<AiPromptTemplateId>, export_toast: Option<&'a ExportToast>) -> Element<'a, Message> {
         let mut column = Column::new().spacing(10).padding(theme_config.padding as u16);
 
         let live_screen_text = screen_to_text(screen);
@@ -541,13 +541,59 @@ impl TerminalRenderer {
         } else {
             terminal_column.into()
         };
-
-        main_area
+        if let Some(toast) = export_toast {
+        let toast_text = toast.message.clone();
+            let toast_container = Container::new(
+                Text::new(toast_text)
+                    .size(11.0)
+                    .style(Color::from_rgb(0.9, 0.9, 0.9)),
+            )
+            .padding([6, 10])
+            .style(|_theme: &Theme| container::Appearance {
+                background: Some(Background::Color(Color::from_rgb(0.18, 0.18, 0.22))),
+                border: Border {
+                    radius: 6.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgb(0.28, 0.28, 0.32),
+                },
+                ..Default::default()
+            });
+            Column::new()
+                .push(toast_container)
+                .push(main_area)
+                .spacing(8)
+                .into()
+        } else {
+            main_area
+        }
     }
 
     fn render_ai_panel<'a>(&self, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, pane_id: usize, theme_config: &'a ThemeConfig, ai_preview: AiContextPreview, ai_settings: &'a AiSettings, ai_redaction_override: bool, ai_last_redactions: &'a [String], ai_last_redacted_preview: Option<&'a str>, ai_selected_template: Option<AiPromptTemplateId>) -> Element<'a, Message> {
         let mut header = Row::new().spacing(8).align_items(Alignment::Center);
         header = header.push(Text::new("AI Assistant").size(14.0));
+        let export_md = Button::new(Text::new("Export MD").size(11.0))
+            .on_press(Message::AiPanelExportConversation(pane_id, ExportFormat::Markdown));
+        let export_json = Button::new(Text::new("Export JSON").size(11.0))
+            .on_press(Message::AiPanelExportConversation(pane_id, ExportFormat::Json));
+        let export_text = Button::new(Text::new("Export TXT").size(11.0))
+            .on_press(Message::AiPanelExportConversation(pane_id, ExportFormat::Text));
+        header = header
+            .push(export_md)
+            .push(export_json)
+            .push(export_text);
+        let export_session_md = Button::new(Text::new("Session MD").size(10.0))
+            .on_press(Message::AiPanelExportSession(ExportFormat::Markdown));
+        let export_session_json = Button::new(Text::new("Session JSON").size(10.0))
+            .on_press(Message::AiPanelExportSession(ExportFormat::Json));
+        let export_session_text = Button::new(Text::new("Session TXT").size(10.0))
+            .on_press(Message::AiPanelExportSession(ExportFormat::Text));
+        let session_export_row = Row::new()
+            .push(Text::new("Session:").size(10.0).style(Color::from_rgb(0.7, 0.7, 0.7)))
+            .push(export_session_md)
+            .push(export_session_json)
+            .push(export_session_text)
+            .spacing(6)
+            .align_items(Alignment::Center);
 
         let scope_label = match ai_context_scope {
             AiContextScope::CurrentCommand => "Context: Current command",
@@ -744,6 +790,7 @@ impl TerminalRenderer {
         let body = Column::new()
             .spacing(10)
             .push(header)
+            .push(session_export_row)
             .push(scope_text)
             .push(scope_row)
             .push(quick_actions)

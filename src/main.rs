@@ -18,7 +18,7 @@ mod ai;
 
 use parser::{TerminalParser, ParserEvent, GitStatus};
 use renderer::{TerminalRenderer, StyleRun};
-use export::{ExportFormat, format_blocks, write_export_file};
+use export::{AiConversationExport, AiConversationExportScope, AiConversationMessage, AiConversationMetadata, AiReferencedBlock, ExportFormat, format_ai_conversation_export, format_blocks, write_ai_export_file, write_export_file};
 use themes::preset_theme;
 use ai::{AiRequest, send_request};
 use pty::PtyManager;
@@ -135,12 +135,18 @@ pub struct AiSettings {
 pub struct AppConfig {
     #[serde(default)]
     pub ai_onboarding_seen: bool,
+    #[serde(default = "default_ai_share_link_enabled")]
+    pub ai_share_link_enabled: bool,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { ai_onboarding_seen: false }
+        Self { ai_onboarding_seen: false, ai_share_link_enabled: true }
     }
+}
+
+fn default_ai_share_link_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,7 +180,7 @@ pub enum AiContextScope {
     EntireSession,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum AiChatRole {
     User,
     Assistant,
@@ -187,7 +193,7 @@ pub struct AiChatMessage {
     pub sources: Vec<AiCitation>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiCitation {
     pub block_index: Option<usize>,
     pub label: String,
@@ -380,6 +386,8 @@ pub enum Message {
     AiPanelReloadRedactionRules,
     AiPanelOpenRedactionPreview(usize),
     AiPanelCloseRedactionPreview(usize),
+    AiPanelExportConversation(usize, ExportFormat),
+    AiPanelExportSession(ExportFormat),
     ToggleAiEnabled,
     UpdateAiSettings(AiSettings),
     AiTemplateSelected(usize, AiPromptTemplateId),
@@ -455,6 +463,13 @@ struct Tant {
     history_search_query: String,
     history_matches: Vec<String>,
     history_selected: usize,
+    export_toast: Option<ExportToast>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportToast {
+    message: String,
+    expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -667,6 +682,119 @@ impl Tant {
         let preview = AiContextPreview { block_count, char_count, token_estimate };
 
         (context, sources, preview)
+    }
+
+    fn build_ai_conversation_export(
+        &self,
+        scope: AiConversationExportScope,
+        tab_index: usize,
+        pane_index: Option<usize>,
+    ) -> Option<AiConversationExport> {
+        let tab = self.layout.get(tab_index)?;
+        let (panes, pane_title, working_directory) = match scope {
+            AiConversationExportScope::Pane => {
+                let pane_id = pane_index?;
+                let pane = tab.panes.get(pane_id)?;
+                (
+                    vec![(pane_id, pane)],
+                    Some(pane.title.clone()),
+                    Some(pane.working_directory.clone()),
+                )
+            }
+            AiConversationExportScope::Session => {
+                let wd = tab
+                    .panes
+                    .get(tab.active_pane)
+                    .map(|pane| pane.working_directory.clone());
+                (tab.panes.iter().enumerate().collect(), None, wd)
+            }
+        };
+
+        let metadata = AiConversationMetadata {
+            exported_at: Utc::now(),
+            scope,
+            tab_title: tab.title.clone(),
+            pane_title,
+            working_directory,
+            host: self.host_info.display.clone(),
+        };
+
+        let mut messages = Vec::new();
+        let mut referenced_blocks = Vec::new();
+        let mut seen_blocks: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+
+        for (pane_id, pane) in panes {
+            for message in &pane.ai_chat {
+                let created_at = pane
+                    .history
+                    .iter()
+                    .filter_map(|block| block.ended_at.or(block.started_at))
+                    .last()
+                    .unwrap_or_else(Utc::now);
+                messages.push(AiConversationMessage {
+                    role: message.role,
+                    content: message.content.clone(),
+                    created_at,
+                    sources: message.sources.clone(),
+                    pane_title: Some(pane.title.clone()),
+                });
+
+                for citation in &message.sources {
+                    if let Some(block_index) = citation.block_index {
+                        let key = (pane_id, block_index);
+                        if seen_blocks.insert(key) {
+                            if let Some(block) = pane.history.get(block_index) {
+                                referenced_blocks.push(AiReferencedBlock {
+                                    pane_id,
+                                    pane_title: pane.title.clone(),
+                                    block_index,
+                                    command: block.command.clone(),
+                                    output: block.output.clone(),
+                                    exit_code: block.exit_code,
+                                    duration_ms: block.duration_ms,
+                                    started_at: block.started_at,
+                                    ended_at: block.ended_at,
+                                    cwd: block.cwd.as_ref().map(|path| path.display().to_string()),
+                                    git_branch: block.git_branch.clone(),
+                                    git_status: block.git_status.clone(),
+                                    host: block.host.clone(),
+                                    is_remote: block.is_remote,
+                                    tags: block.tags.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(AiConversationExport {
+            metadata,
+            messages,
+            referenced_blocks,
+        })
+    }
+
+    fn handle_ai_export(&mut self, export: AiConversationExport, scope: AiConversationExportScope, format: ExportFormat) -> Command<Message> {
+        if let Ok(result) = format_ai_conversation_export(&export, format) {
+            if let Ok(path) = write_ai_export_file(std::path::Path::new("exports"), scope, format, &result.content) {
+                let mut toast_message = format!("AI export saved: {}", path.display());
+                if self.app_config.ai_share_link_enabled {
+                    let link = format!("file://{}", path.display());
+                    toast_message.push_str(&format!(" • Link copied: {}", link));
+                    self.export_toast = Some(ExportToast {
+                        message: toast_message,
+                        expires_at: Utc::now() + chrono::Duration::seconds(6),
+                    });
+                    return clipboard::write(link);
+                }
+                self.export_toast = Some(ExportToast {
+                    message: toast_message,
+                    expires_at: Utc::now() + chrono::Duration::seconds(6),
+                });
+            }
+        }
+        Command::none()
     }
 
 
@@ -1361,7 +1489,7 @@ impl Application for Tant {
         };
         let theme_config = preset_theme("one_dark");
         (
-            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, app_config, ai_onboarding_open, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 }, renaming_tab: None, rename_buffer: String::new(), history_search_active: false, history_search_query: String::new(), history_matches: Vec::new(), history_selected: 0 },
+            Tant { layout, active_tab, renderer, search_query: String::new(), search_success_only: false, search_failure_only: false, search_pinned_only: false, search_input_id: text_input::Id::unique(), ai_settings, ai_response: None, app_config, ai_onboarding_open, show_command_palette: false, palette_query: String::new(), palette_selected: 0, render_cache: Arc::new(Mutex::new(HashMap::new())), row_hashes: Arc::new(Mutex::new(HashMap::new())), theme_config, host_info: resolve_host_info(), window_size: Size::new(1024.0, 768.0), resize_state: None, last_cursor_pos: Point { x: 0.0, y: 0.0 }, renaming_tab: None, rename_buffer: String::new(), history_search_active: false, history_search_query: String::new(), history_matches: Vec::new(), history_selected: 0, export_toast: None },
             window::gain_focus(window::Id::MAIN)
         )
     }
@@ -1394,6 +1522,11 @@ impl Application for Tant {
                                 }
                             }
                         }
+                    }
+                }
+                if let Some(toast) = &self.export_toast {
+                    if toast.expires_at <= Utc::now() {
+                        self.export_toast = None;
                     }
                 }
                 let mut has_new_data = false;
@@ -1998,6 +2131,26 @@ impl Application for Tant {
                 }
                 Command::none()
             }
+            Message::AiPanelExportConversation(pane_id, format) => {
+                if let Some(export) = self.build_ai_conversation_export(
+                    AiConversationExportScope::Pane,
+                    self.active_tab,
+                    Some(pane_id),
+                ) {
+                    return self.handle_ai_export(export, AiConversationExportScope::Pane, format);
+                }
+                Command::none()
+            }
+            Message::AiPanelExportSession(format) => {
+                if let Some(export) = self.build_ai_conversation_export(
+                    AiConversationExportScope::Session,
+                    self.active_tab,
+                    None,
+                ) {
+                    return self.handle_ai_export(export, AiConversationExportScope::Session, format);
+                }
+                Command::none()
+            }
             Message::ToggleCollapsed(index) => {
                 if let Some(tab) = self.layout.get_mut(self.active_tab) {
                     if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
@@ -2549,7 +2702,7 @@ impl Application for Tant {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None, None)
+            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None, None, self.export_toast.as_ref())
         };
 
         if self.ai_onboarding_open {
@@ -2616,7 +2769,7 @@ impl Tant {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
                     let ai_preview = self.resolve_context_preview(pane, pane.ai_context_scope);
-                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, pane.ai_panel_open, pane.ai_context_scope, &pane.ai_chat, &pane.ai_input, pane.ai_pending, pane.ai_streaming, ai_preview, pane.highlighted_block, pane.history_scroll_id.clone(), pane.ai_redaction_override, &pane.ai_last_redactions, pane.ai_last_redacted_preview.as_deref(), pane.ai_selected_template);
+                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, pane.ai_panel_open, pane.ai_context_scope, &pane.ai_chat, &pane.ai_input, pane.ai_pending, pane.ai_streaming, ai_preview, pane.highlighted_block, pane.history_scroll_id.clone(), pane.ai_redaction_override, &pane.ai_last_redactions, pane.ai_last_redacted_preview.as_deref(), pane.ai_selected_template, self.export_toast.as_ref());
                     let is_active = self
                         .layout
                         .get(self.active_tab)
@@ -2642,7 +2795,7 @@ impl Tant {
                         .into()
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
-                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None, None)
+                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique(), false, &[], None, None, self.export_toast.as_ref())
                 }
             }
             LayoutNode::Split { axis, ratio, left, right } => {
