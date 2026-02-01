@@ -1,6 +1,6 @@
 // Renderer + UI shell
 
-use iced::widget::{Canvas, Column, Row, Text, Scrollable, Container, container, Checkbox};
+use iced::widget::{Canvas, Column, Row, Text, Scrollable, Container, container, Checkbox, mouse_area, scrollable};
 use iced::widget::button::Button;
 use iced::widget::text_input::TextInput;
 use iced::{Element, Length, Color, Point, Size, Rectangle, Theme, Pixels, Font, Alignment, Border, Background};
@@ -8,7 +8,7 @@ use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
 use vt100;
 use chrono::Utc;
-use crate::{Message, AiSettings, Block, ThemeConfig, Tab, AiChatMessage, AiChatRole, AiContextScope, AiQuickAction};
+use crate::{Message, AiSettings, Block, ThemeConfig, Tab, AiChatMessage, AiChatRole, AiContextScope, AiQuickAction, AiContextPreview};
 use crate::export::ExportFormat;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher, DefaultHasher};
@@ -223,7 +223,7 @@ impl TerminalRenderer {
         (8.0, theme_config.line_height * theme_config.font_size)
     }
 
-    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize, ai_panel_open: bool, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool) -> Element<'a, Message> {
+    pub fn view<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, alt_screen_active: bool, _ai_settings: &'a AiSettings, _ai_response: &'a Option<String>, _scroll_offset: usize, _selection_start: Option<(usize, usize)>, _selection_end: Option<(usize, usize)>, render_cache: &Arc<Mutex<HashMap<(usize, usize, u16), Vec<StyleRun>>>>, row_hashes: &Arc<Mutex<HashMap<(usize, usize, u16), u64>>>, tab_id: usize, pane_id: usize, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize, ai_panel_open: bool, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, ai_preview: AiContextPreview, highlighted_block: Option<usize>, history_scroll_id: scrollable::Id) -> Element<'a, Message> {
         // Use raw terminal mode for TUI apps (vim, top, etc.), block mode for normal shell
         if alt_screen_active {
             let canvas = Canvas::new(TerminalCanvas {
@@ -239,7 +239,7 @@ impl TerminalRenderer {
             .height(Length::Fill);
 
             if ai_panel_open {
-                let panel = self.render_ai_panel(ai_context_scope, ai_chat, ai_input, ai_pending, ai_streaming, pane_id, theme_config);
+                let panel = self.render_ai_panel(ai_context_scope, ai_chat, ai_input, ai_pending, ai_streaming, pane_id, theme_config, ai_preview);
                 Row::new()
                     .push(Container::new(canvas).width(Length::FillPortion(7)))
                     .push(Container::new(panel).width(Length::FillPortion(3)))
@@ -249,11 +249,11 @@ impl TerminalRenderer {
                 canvas.into()
             }
         } else {
-            self.render_blocks(history, current, current_command, search_query, search_success_only, search_failure_only, search_pinned_only, search_input_id, screen, theme_config, tabs, active_tab, renaming_tab, rename_buffer, history_search_active, history_search_query, history_matches, history_selected, ai_panel_open, ai_context_scope, ai_chat, ai_input, ai_pending, ai_streaming, pane_id)
+            self.render_blocks(history, current, current_command, search_query, search_success_only, search_failure_only, search_pinned_only, search_input_id, screen, theme_config, tabs, active_tab, renaming_tab, rename_buffer, history_search_active, history_search_query, history_matches, history_selected, ai_panel_open, ai_context_scope, ai_chat, ai_input, ai_pending, ai_streaming, pane_id, highlighted_block, ai_preview, history_scroll_id)
         }
     }
 
-    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize, ai_panel_open: bool, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, pane_id: usize) -> Element<'a, Message> {
+    fn render_blocks<'a>(&self, history: &'a [Block], current: &'a Option<Block>, current_command: &'a str, search_query: &'a str, search_success_only: bool, search_failure_only: bool, search_pinned_only: bool, search_input_id: iced::widget::text_input::Id, screen: &vt100::Screen, theme_config: &'a ThemeConfig, tabs: &'a [Tab], active_tab: usize, renaming_tab: Option<usize>, rename_buffer: &'a str, history_search_active: bool, history_search_query: &'a str, history_matches: &'a [String], history_selected: usize, ai_panel_open: bool, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, pane_id: usize, highlighted_block: Option<usize>, ai_preview: AiContextPreview, history_scroll_id: scrollable::Id) -> Element<'a, Message> {
         let mut column = Column::new().spacing(10).padding(theme_config.padding as u16);
 
         let live_screen_text = screen_to_text(screen);
@@ -339,7 +339,7 @@ impl TerminalRenderer {
 
         // Render history blocks
         for (index, block, ranges) in filtered_blocks {
-            let block_widget = self.render_block(block, index, theme_config, search_query, ranges, &prompt_line);
+            let block_widget = self.render_block(block, index, theme_config, search_query, ranges, &prompt_line, highlighted_block == Some(index));
             column = column.push(block_widget);
         }
 
@@ -350,6 +350,7 @@ impl TerminalRenderer {
         }
 
         let scrollable = Scrollable::new(column)
+            .id(history_scroll_id)
             .width(Length::Fill)
             .height(Length::FillPortion(9));
 
@@ -531,7 +532,7 @@ impl TerminalRenderer {
             .spacing(0);
 
         let main_area: Element<'a, Message> = if ai_panel_open {
-            let panel = self.render_ai_panel(ai_context_scope, ai_chat, ai_input, ai_pending, ai_streaming, pane_id, theme_config);
+            let panel = self.render_ai_panel(ai_context_scope, ai_chat, ai_input, ai_pending, ai_streaming, pane_id, theme_config, ai_preview);
             Row::new()
                 .push(Container::new(terminal_column).width(Length::FillPortion(7)))
                 .push(Container::new(panel).width(Length::FillPortion(3)))
@@ -544,7 +545,7 @@ impl TerminalRenderer {
         main_area
     }
 
-    fn render_ai_panel<'a>(&self, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, pane_id: usize, theme_config: &'a ThemeConfig) -> Element<'a, Message> {
+    fn render_ai_panel<'a>(&self, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, pane_id: usize, theme_config: &'a ThemeConfig, ai_preview: AiContextPreview) -> Element<'a, Message> {
         let mut header = Row::new().spacing(8).align_items(Alignment::Center);
         header = header.push(Text::new("AI Assistant").size(14.0));
 
@@ -569,6 +570,10 @@ impl TerminalRenderer {
             .push(Button::new(Text::new("Generate Command").size(11.0)).on_press(Message::AiPanelQuickAction(pane_id, AiQuickAction::GenerateCommand)))
             .spacing(6);
 
+        let preview_text = Text::new(format!("Context: {} blocks • {} chars • ~{} tokens", ai_preview.block_count, ai_preview.char_count, ai_preview.token_estimate))
+            .size(11.0)
+            .style(Color::from_rgb(0.65, 0.65, 0.65));
+
         let mut chat_column = Column::new().spacing(8);
         for message in ai_chat {
             let role_label = match message.role {
@@ -583,12 +588,36 @@ impl TerminalRenderer {
                 .push(Text::new(role_label).size(11.0).style(role_color))
                 .spacing(4);
 
-            let sources = if message.sources.is_empty() {
-                Text::new("sources: none").size(10.0).style(Color::from_rgb(0.55, 0.55, 0.55))
+            let sources: Element<'a, Message> = if message.sources.is_empty() {
+                Text::new("sources: none").size(10.0).style(Color::from_rgb(0.55, 0.55, 0.55)).into()
             } else {
-                Text::new(format!("sources: {}", message.sources.join(", ")))
-                    .size(10.0)
-                    .style(Color::from_rgb(0.55, 0.55, 0.55))
+                let mut chip_row = Row::new().spacing(6);
+                for citation in &message.sources {
+                    let label = citation.label.clone();
+                    let block_index = citation.block_index;
+                    let chip = mouse_area(
+                        Container::new(Text::new(label).size(10.0))
+                            .padding([2, 6])
+                            .style(|_theme: &Theme| container::Appearance {
+                                background: Some(Background::Color(Color::from_rgb(0.18, 0.20, 0.24))),
+                                border: Border {
+                                    radius: 10.0.into(),
+                                    width: 1.0,
+                                    color: Color::from_rgb(0.28, 0.30, 0.36),
+                                },
+                                ..Default::default()
+                            }),
+                    )
+                    .on_enter(Message::AiPanelHoverCitation(pane_id, block_index))
+                    .on_exit(Message::AiPanelHoverCitation(pane_id, None))
+                    .on_press(match block_index {
+                        Some(index) => Message::AiPanelJumpToBlock(pane_id, index),
+                        None => Message::AiPanelHoverCitation(pane_id, None),
+                    });
+                    chip_row = chip_row.push(chip);
+                }
+                let sources_label = Text::new("sources:").size(10.0).style(Color::from_rgb(0.55, 0.55, 0.55));
+                Row::new().spacing(6).push(sources_label).push(chip_row).into()
             };
             let body = Text::new(message.content.clone())
                 .font(Font::MONOSPACE)
@@ -643,6 +672,7 @@ impl TerminalRenderer {
             .push(scope_text)
             .push(scope_row)
             .push(quick_actions)
+            .push(preview_text)
             .push(chat_scroll)
             .push(input_row)
             .push(status_text)
@@ -730,7 +760,7 @@ impl TerminalRenderer {
             .into()
     }
 
-    fn render_block<'a>(&self, block: &'a Block, index: usize, theme_config: &'a ThemeConfig, search_query: &'a str, ranges: MatchRanges, prompt_line: &str) -> Element<'a, Message> {
+    fn render_block<'a>(&self, block: &'a Block, index: usize, theme_config: &'a ThemeConfig, search_query: &'a str, ranges: MatchRanges, prompt_line: &str, highlighted: bool) -> Element<'a, Message> {
         let (status_display, status_color) = match block.exit_code {
             Some(0) => ("Success".to_string(), Color::from_rgb(0.25, 0.8, 0.4)),
             Some(code) => (format!("Exit {}", code), Color::from_rgb(0.9, 0.35, 0.35)),
@@ -839,15 +869,26 @@ impl TerminalRenderer {
             column = column.push(output_container);
         }
 
+        let highlight_color = if highlighted {
+            Color::from_rgb(0.28, 0.24, 0.12)
+        } else {
+            Color::from_rgb(0.13, 0.13, 0.13)
+        };
+        let border_color = if highlighted {
+            Color::from_rgb(0.95, 0.75, 0.35)
+        } else {
+            Color::from_rgb(0.2, 0.2, 0.2)
+        };
+
         Container::new(column)
             .width(Length::Fill)
             .padding(6)
-            .style(|_theme: &Theme| container::Appearance {
-                background: Some(Background::Color(Color::from_rgb(0.13, 0.13, 0.13))),
+            .style(move |_theme: &Theme| container::Appearance {
+                background: Some(Background::Color(highlight_color)),
                 border: Border {
                     radius: 10.0.into(),
                     width: 1.0,
-                    color: Color::from_rgb(0.2, 0.2, 0.2),
+                    color: border_color,
                 },
                 ..Default::default()
             })

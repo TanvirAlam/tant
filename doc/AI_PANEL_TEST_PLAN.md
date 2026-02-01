@@ -13,6 +13,14 @@ These are test cases intended for automation; they describe expected behavior an
 ### Context Scope Selection
 1. Open AI panel and click each context scope (Current, Last N, Selected, All).
    - **Expected:** The scope label updates to match the selected scope.
+2. Open command palette and select "AI Context: Current", "AI Context: Last N", "AI Context: Selected", "AI Context: All".
+   - **Expected:** The AI panel scope label updates to the chosen context.
+
+### Payload Preview
+1. With no blocks available, open the AI panel.
+   - **Expected:** Context preview shows 0 blocks and low char/token counts.
+2. Run 2-3 commands to generate blocks and set context to "Last N".
+   - **Expected:** Preview updates with block count > 0 and higher char/token estimates.
 
 ### Chat History Persistence (Per Pane)
 1. In Pane A, send a message and receive an AI response.
@@ -34,7 +42,11 @@ These are test cases intended for automation; they describe expected behavior an
 
 ### Sources Display
 1. With context scope "Last N" or "Selected", send a message.
-   - **Expected:** Assistant message shows sources (block IDs/timestamps or labels) in the message header.
+   - **Expected:** Assistant message shows sources as inline chips for each block.
+2. Hover a citation chip.
+   - **Expected:** The referenced block highlights in the history list.
+3. Click a citation chip.
+   - **Expected:** The history list scrolls to the referenced block and keeps it highlighted.
 
 ## Manual Testing Steps
 
@@ -59,9 +71,14 @@ These are test cases intended for automation; they describe expected behavior an
    - Click "Stop" while the response is streaming.
    - **Expected:** Streaming halts and response does not change further.
 5. Context scope checks:
-   - Select each context scope (Current, Last N, Selected, All).
-   - Send a message.
-   - **Expected:** Sources list in assistant bubble reflects the chosen scope.
+    - Select each context scope (Current, Last N, Selected, All).
+    - Send a message.
+    - **Expected:** Sources list in assistant bubble reflects the chosen scope.
+    - **Expected:** Preview updates with the expected block count and char/token estimate.
+6. Command palette context picker:
+    - Press `Ctrl+K` to open the palette.
+    - Choose an "AI Context: ..." action.
+    - **Expected:** AI panel scope label updates immediately.
 6. Per-pane persistence:
    - Split pane (`Cmd+D` horizontal or `Cmd+Shift+D` vertical).
    - Open AI panel in each pane and send distinct messages.
@@ -71,4 +88,4 @@ These are test cases intended for automation; they describe expected behavior an
 1. Execute two commands to create blocks.
 2. Use block selection checkboxes to select one block.
 3. Choose "Selected" scope and send a message.
-   - **Expected:** Sources show only the selected block label.
+   - **Expected:** Sources show only the selected block label and the chip clicks back to that block.

@@ -1,6 +1,7 @@
 use iced::{Application, Command, Element, Settings, Subscription, Theme, time, window, mouse, clipboard, Point, Length, Color, Size, Rectangle, Border, Background};
 use iced::keyboard::{self, Key, Modifiers};
-use iced::widget::{Row, Column, container, TextInput, text_input};
+use iced::widget::{Row, Column, container, TextInput, text_input, scrollable};
+use iced::widget::scrollable::RelativeOffset;
 use log::{debug, info, warn, error};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
@@ -80,6 +81,8 @@ pub struct Pane {
     pub ai_stream_remaining: String,
     pub ai_stream_target: Option<usize>,
     pub ai_request_id: u64,
+    pub history_scroll_id: scrollable::Id,
+    pub highlighted_block: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -140,7 +143,13 @@ pub enum AiChatRole {
 pub struct AiChatMessage {
     pub role: AiChatRole,
     pub content: String,
-    pub sources: Vec<String>,
+    pub sources: Vec<AiCitation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AiCitation {
+    pub block_index: Option<usize>,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -165,6 +174,7 @@ pub enum PaletteAction {
     RunPinnedCommand(usize),
     ToggleAi,
     ToggleAiPanel,
+    SetAiContextScope(AiContextScope),
     ExportTheme,
     ImportTheme,
     // Add more as needed
@@ -214,6 +224,8 @@ impl Pane {
             ai_stream_remaining: String::new(),
             ai_stream_target: None,
             ai_request_id: 0,
+            history_scroll_id: scrollable::Id::unique(),
+            highlighted_block: None,
         })
     }
 }
@@ -262,6 +274,8 @@ pub enum Message {
     AiPanelStop(usize),
     AiPanelSetScope(usize, AiContextScope),
     AiPanelQuickAction(usize, AiQuickAction),
+    AiPanelHoverCitation(usize, Option<usize>),
+    AiPanelJumpToBlock(usize, usize),
     ToggleAiEnabled,
     UpdateAiSettings(AiSettings),
     Paste(String),
@@ -334,6 +348,13 @@ struct Tant {
     history_selected: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AiContextPreview {
+    pub block_count: usize,
+    pub char_count: usize,
+    pub token_estimate: usize,
+}
+
 #[derive(Debug, Clone)]
 struct HostInfo {
     display: String,
@@ -397,7 +418,12 @@ impl Tant {
         }
     }
 
-    fn build_ai_context(&self, pane: &Pane, scope: AiContextScope) -> (String, Vec<String>) {
+    fn resolve_context_preview(&self, pane: &Pane, scope: AiContextScope) -> AiContextPreview {
+        let (_context, _sources, preview) = self.build_ai_context(pane, scope);
+        preview
+    }
+
+    fn build_ai_context(&self, pane: &Pane, scope: AiContextScope) -> (String, Vec<AiCitation>, AiContextPreview) {
         let mut sources = Vec::new();
         let mut context = String::new();
         let cwd = pane.working_directory.clone();
@@ -421,7 +447,7 @@ impl Tant {
 
         match scope {
             AiContextScope::CurrentCommand => {
-                sources.push("current_command".to_string());
+                sources.push(AiCitation { block_index: None, label: "current_command".to_string() });
                 context.push_str("\nCurrent command:\n");
                 context.push_str(&pane.current_command);
                 context.push('\n');
@@ -433,15 +459,21 @@ impl Tant {
                     context.push_str("\nCommand blocks:\n");
                     for (index, block) in blocks {
                         let label = self.block_label(index, block);
-                        sources.push(label.clone());
+                        sources.push(AiCitation { block_index: Some(index), label: label.clone() });
                         context.push_str(&format!("\n[{}]\nCommand: {}\nExit: {:?}\nOutput:\n{}\n", label, block.command, block.exit_code, block.output));
                     }
                 }
             }
         }
 
-        (context, sources)
+        let char_count = context.chars().count();
+        let token_estimate = (char_count / 4).max(1);
+        let block_count = sources.iter().filter(|item| item.block_index.is_some()).count();
+        let preview = AiContextPreview { block_count, char_count, token_estimate };
+
+        (context, sources, preview)
     }
+
 
     fn update_history_matches(&mut self) {
         let query = self.history_search_query.to_lowercase();
@@ -941,6 +973,13 @@ impl Tant {
                     }
                 }
             }
+            PaletteAction::SetAiContextScope(scope) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
+                        pane.ai_context_scope = scope;
+                    }
+                }
+            }
             PaletteAction::ExportTheme => {
                 if let Err(e) = self.export_theme() {
                     error!("Failed to export theme: {}", e);
@@ -996,6 +1035,10 @@ impl Tant {
             ("Close Pane", PaletteAction::ClosePane),
             ("Toggle AI", PaletteAction::ToggleAi),
             ("Toggle AI Panel", PaletteAction::ToggleAiPanel),
+            ("AI Context: Current", PaletteAction::SetAiContextScope(AiContextScope::CurrentCommand)),
+            ("AI Context: Last N", PaletteAction::SetAiContextScope(AiContextScope::LastNBlocks)),
+            ("AI Context: Selected", PaletteAction::SetAiContextScope(AiContextScope::SelectedBlocks)),
+            ("AI Context: All", PaletteAction::SetAiContextScope(AiContextScope::EntireSession)),
             ("Export Theme", PaletteAction::ExportTheme),
             ("Import Theme", PaletteAction::ImportTheme),
         ];
@@ -1853,6 +1896,30 @@ impl Application for Tant {
                 }
                 Command::none()
             }
+            Message::AiPanelHoverCitation(pane_id, block_index) => {
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        pane.highlighted_block = block_index;
+                    }
+                }
+                Command::none()
+            }
+            Message::AiPanelJumpToBlock(pane_id, block_index) => {
+                let mut scroll_cmd = Command::none();
+                if let Some(tab) = self.layout.get_mut(self.active_tab) {
+                    if let Some(pane) = tab.panes.get_mut(pane_id) {
+                        pane.highlighted_block = Some(block_index);
+                        pane.follow_mode = false;
+                        let total_blocks = pane.history.len().max(1);
+                        let ratio = (block_index as f32 / (total_blocks.saturating_sub(1) as f32).max(1.0)).clamp(0.0, 1.0);
+                        scroll_cmd = scrollable::snap_to(
+                            pane.history_scroll_id.clone(),
+                            RelativeOffset { x: 0.0, y: ratio },
+                        );
+                    }
+                }
+                scroll_cmd
+            }
             Message::AiPanelQuickAction(pane_id, action) => {
                 let action_label = match action {
                     AiQuickAction::ExplainError => "Explain Error",
@@ -1871,14 +1938,14 @@ impl Application for Tant {
                     return Command::none();
                 }
 
-                let (user_text, context, sources) = if let Some(tab) = self.layout.get(self.active_tab) {
+                let (user_text, context, sources, _preview) = if let Some(tab) = self.layout.get(self.active_tab) {
                     if let Some(pane) = tab.panes.get(pane_id) {
                         let user_text = pane.ai_input.trim().to_string();
                         if user_text.is_empty() {
                             return Command::none();
                         }
-                        let (context, sources) = self.build_ai_context(pane, pane.ai_context_scope);
-                        (user_text, context, sources)
+                        let (context, sources, preview) = self.build_ai_context(pane, pane.ai_context_scope);
+                        (user_text, context, sources, preview)
                     } else {
                         return Command::none();
                     }
@@ -2171,7 +2238,7 @@ impl Application for Tant {
             self.build_layout_view(&tab.root, &tab.panes)
         } else {
             let dummy_parser = TerminalParser::new(24, 80);
-            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false)
+            self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, 0, 0, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique())
         };
 
         if self.show_command_palette {
@@ -2235,7 +2302,8 @@ impl Tant {
         match node {
             LayoutNode::Leaf { pane_id } => {
                 if let Some(pane) = panes.get(*pane_id) {
-                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, pane.ai_panel_open, pane.ai_context_scope, &pane.ai_chat, &pane.ai_input, pane.ai_pending, pane.ai_streaming);
+                    let ai_preview = self.resolve_context_preview(pane, pane.ai_context_scope);
+                    let view = self.renderer.view(&pane.history, &pane.current_block, &pane.current_command, &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), pane.parser.screen(), pane.parser.is_alt_screen_active(), &self.ai_settings, &self.ai_response, pane.scroll_offset, pane.selection_start, pane.selection_end, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, pane.ai_panel_open, pane.ai_context_scope, &pane.ai_chat, &pane.ai_input, pane.ai_pending, pane.ai_streaming, ai_preview, pane.highlighted_block, pane.history_scroll_id.clone());
                     let is_active = self
                         .layout
                         .get(self.active_tab)
@@ -2261,7 +2329,7 @@ impl Tant {
                         .into()
                 } else {
                     let dummy_parser = TerminalParser::new(24, 80);
-                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false)
+                    self.renderer.view(&[], &None, "", &self.search_query, self.search_success_only, self.search_failure_only, self.search_pinned_only, self.search_input_id.clone(), dummy_parser.screen(), false, &self.ai_settings, &self.ai_response, 0, None, None, &self.render_cache, &self.row_hashes, self.active_tab, *pane_id, &self.theme_config, &self.layout, self.active_tab, self.renaming_tab, &self.rename_buffer, self.history_search_active, &self.history_search_query, &self.history_matches, self.history_selected, false, AiContextScope::LastNBlocks, &[], "", false, false, AiContextPreview { block_count: 0, char_count: 0, token_estimate: 0 }, None, scrollable::Id::unique())
                 }
             }
             LayoutNode::Split { axis, ratio, left, right } => {
