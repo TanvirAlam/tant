@@ -22,6 +22,11 @@ _tant_osc() {
     printf "\033]133;%s\007" "$1"
 }
 
+# Emit OSC 7 current directory sequence
+_tant_osc7_cwd() {
+    printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"
+}
+
 # Emit git info (branch + status) using OSC 133;G
 _tant_emit_git_info() {
     local git_info
@@ -53,6 +58,9 @@ _tant_preexec() {
 # Pre-prompt hook: runs before each prompt display
 _tant_precmd() {
     local exit_code=$?
+
+    # Emit current directory (OSC 7)
+    _tant_osc7_cwd
     
     # Emit command end marker with exit code
     _tant_osc "D;$exit_code"

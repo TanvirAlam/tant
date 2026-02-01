@@ -21,6 +21,11 @@ function _tant_osc
     printf "\033]133;%s\007" $argv[1]
 end
 
+# Emit OSC 7 current directory sequence
+function _tant_osc7_cwd
+    printf "\033]7;file://%s%s\007" (hostname) "$PWD"
+end
+
 # Emit git info (branch + status) using OSC 133;G
 function _tant_emit_git_info
     set -l git_info (git -C . status --porcelain=v2 -b 2>/dev/null)
@@ -59,6 +64,7 @@ end
 function _tant_prompt_start --on-event fish_prompt
     # Emit prompt start marker
     _tant_osc "A"
+    _tant_osc7_cwd
     _tant_emit_git_info
 end
 
@@ -72,6 +78,7 @@ if not functions -q _tant_original_fish_prompt
     function fish_prompt
         # Emit prompt start
         _tant_osc "A"
+        _tant_osc7_cwd
         
         # Call original prompt
         _tant_original_fish_prompt
@@ -93,5 +100,6 @@ end
 
 # Emit initial prompt start marker
 _tant_osc "A"
+_tant_osc7_cwd
 
 echo "Tant shell integration loaded for fish"

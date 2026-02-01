@@ -20,6 +20,7 @@ const OSC_PROMPT_START: &str = "\x1b]133;A";
 const OSC_COMMAND_START: &str = "\x1b]133;C";
 const OSC_COMMAND_END_PREFIX: &str = "\x1b]133;D";
 const OSC_GIT_INFO_PREFIX: &str = "\x1b]133;G;";
+const OSC_DIRECTORY_PREFIX: &str = "\x1b]7;file://";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GitStatus {
@@ -114,6 +115,17 @@ impl TerminalParser {
                 }
             }
         }
+
+        if let Some(pos) = buffer_str.rfind(OSC_DIRECTORY_PREFIX) {
+            let rest = &buffer_str[pos + OSC_DIRECTORY_PREFIX.len()..];
+            if let Some(end_pos) = rest.find('\x07').or_else(|| rest.find("\x1b\\")) {
+                let payload = &rest[..end_pos];
+                if let Some(dir) = Self::parse_osc7_directory(payload) {
+                    self.events.push(ParserEvent::Directory(dir));
+                    log::debug!("[Shell Integration] Directory detected");
+                }
+            }
+        }
         
         // Limit buffer size to prevent unbounded growth
         if self.buffer.len() > 8192 {
@@ -146,6 +158,37 @@ impl TerminalParser {
             }
         }
         branch.map(|branch| (branch, status))
+    }
+
+    fn parse_osc7_directory(payload: &str) -> Option<String> {
+        let path_start = payload.find('/')?;
+        let raw_path = &payload[path_start..];
+        let decoded = Self::percent_decode(raw_path);
+        Some(decoded)
+    }
+
+    fn percent_decode(input: &str) -> String {
+        let mut out = String::new();
+        let mut chars = input.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                let h1 = chars.next();
+                let h2 = chars.next();
+                if let (Some(h1), Some(h2)) = (h1, h2) {
+                    let hex = format!("{}{}", h1, h2);
+                    if let Ok(value) = u8::from_str_radix(&hex, 16) {
+                        out.push(value as char);
+                        continue;
+                    }
+                }
+                out.push('%');
+                if let Some(h1) = h1 { out.push(h1); }
+                if let Some(h2) = h2 { out.push(h2); }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
     }
 
     pub fn screen(&self) -> &vt100::Screen {

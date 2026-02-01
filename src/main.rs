@@ -1029,8 +1029,8 @@ impl Application for Tant {
                                 ParserEvent::Directory(dir) => {
                                     if let Some(ref mut block) = pane.current_block {
                                         block.cwd = Some(std::path::PathBuf::from(&dir));
-                                        pane.working_directory = dir;
                                     }
+                                    pane.working_directory = dir;
                                 }
                                 ParserEvent::GitInfo { branch, status } => {
                                     if let Some(ref mut block) = pane.current_block {
