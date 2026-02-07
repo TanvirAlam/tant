@@ -1728,7 +1728,7 @@ impl Application for Tant {
             send_current_command: true,
             send_last_n_blocks: 5,
             send_repo_context: false,
-            provider: "ollama".to_string(),
+            provider: "openai".to_string(),  // Changed from ollama to openai
             api_key: None,
             redact_secrets: true,
             allow_sensitive: false,
@@ -2634,7 +2634,8 @@ impl Application for Tant {
                     if let Some(pane) = tab.panes.get_mut(pane_id) {
                         pane.ai_input.clear();
                         pane.ai_pending = true;
-                        pane.ai_streaming = true;
+                        let limits = Self::plan_limits(self.billing_profile.plan);
+                        pane.ai_streaming = limits.allow_streaming;  // Only stream if plan allows it
                         pane.ai_request_id = pane.ai_request_id.wrapping_add(1);
                         let request_id = pane.ai_request_id;
                         let user_message = AiChatMessage {
@@ -2734,23 +2735,60 @@ impl Application for Tant {
                     if let Some(pane) = tab.panes.get_mut(pane_id) {
                         if pane.ai_request_id == request_id {
                             pane.ai_pending = false;
-                            pane.ai_stream_remaining = response;
+                            
+                            // Check if response is an error
+                            let is_error = response.starts_with("AI error") || response.contains("Missing API key");
+                            
+                            if is_error {
+                                // Show error in a friendly way
+                                let error_msg = if response.contains("Missing API key") {
+                                    "❌ Sorry, I couldn't connect. Please check your API key in .env file.".to_string()
+                                } else {
+                                    format!("❌ {}", response.replace("AI error", "Error"))
+                                };
+                                pane.ai_stream_remaining = error_msg;
+                            } else {
+                                pane.ai_stream_remaining = response.clone();
+                            }
+                            
+                            // For non-streaming (Free plan), show response immediately
+                            let limits = Self::plan_limits(self.billing_profile.plan);
+                            if !limits.allow_streaming {
+                                if let Some(target) = pane.ai_stream_target {
+                                    if let Some(message) = pane.ai_chat.get_mut(target) {
+                                        message.content = pane.ai_stream_remaining.clone();
+                                    }
+                                }
+                                pane.ai_stream_remaining.clear();
+                                pane.ai_streaming = false;
+                                pane.ai_stream_target = None;
+                            }
+                            
                             let duration_ms = pane
                                 .ai_request_started_at
                                 .map(|started| (Utc::now() - started).num_milliseconds().max(0) as u64)
                                 .unwrap_or(0);
-                            let entry = UsageEntry {
-                                timestamp: Utc::now(),
-                                request_chars: pane.ai_request_chars,
-                                response_chars: pane.ai_stream_remaining.chars().count(),
-                                duration_ms,
-                                provider: pane.ai_request_provider.clone().unwrap_or_else(|| "unknown".to_string()),
-                                model: pane.ai_request_model.clone().unwrap_or_else(|| "unknown".to_string()),
-                            };
-                            self.usage_ledger.entries.push(entry);
-                            let _ = self.save_usage_ledger();
-                            let limits = Self::plan_limits(self.billing_profile.plan);
-                            self.usage_snapshot = self.compute_usage_snapshot(&limits);
+                            
+                            // Only log successful responses
+                            if !is_error {
+                                let response_len = if limits.allow_streaming {
+                                    pane.ai_stream_remaining.chars().count()
+                                } else {
+                                    response.chars().count()
+                                };
+                                let entry = UsageEntry {
+                                    timestamp: Utc::now(),
+                                    request_chars: pane.ai_request_chars,
+                                    response_chars: response_len,
+                                    duration_ms,
+                                    provider: pane.ai_request_provider.clone().unwrap_or_else(|| "unknown".to_string()),
+                                    model: pane.ai_request_model.clone().unwrap_or_else(|| "unknown".to_string()),
+                                };
+                                self.usage_ledger.entries.push(entry);
+                                let _ = self.save_usage_ledger();
+                                let limits = Self::plan_limits(self.billing_profile.plan);
+                                self.usage_snapshot = self.compute_usage_snapshot(&limits);
+                            }
                         }
                     }
                 }

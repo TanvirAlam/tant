@@ -8,7 +8,7 @@ use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
 use vt100;
 use chrono::Utc;
-use crate::{ExportToast, Message, AiSettings, Block, ThemeConfig, Tab, AiChatMessage, AiChatRole, AiContextScope, AiQuickAction, AiContextPreview, AI_PROMPT_TEMPLATES, AiPromptTemplateId, PlanTier, PlanLimits, UsageSnapshot};
+use crate::{ExportToast, Message, AiSettings, Block, ThemeConfig, Tab, AiChatMessage, AiChatRole, AiContextScope, AiQuickAction, AiContextPreview, AiPromptTemplateId, PlanTier, PlanLimits, UsageSnapshot, AiCitation, LayoutNode, Axis};
 use crate::export::ExportFormat;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher, DefaultHasher};
@@ -568,258 +568,173 @@ impl TerminalRenderer {
         }
     }
 
-    fn render_ai_panel<'a>(&self, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, pane_id: usize, theme_config: &'a ThemeConfig, ai_preview: AiContextPreview, ai_settings: &'a AiSettings, ai_redaction_override: bool, ai_last_redactions: &'a [String], ai_last_redacted_preview: Option<&'a str>, ai_selected_template: Option<AiPromptTemplateId>, plan_tier: PlanTier, plan_limits: PlanLimits, usage_snapshot: UsageSnapshot) -> Element<'a, Message> {
-        let mut header = Row::new().spacing(8).align_items(Alignment::Center);
-        header = header.push(Text::new("AI Assistant").size(14.0));
-        let export_md = Button::new(Text::new("Export MD").size(11.0))
-            .on_press(Message::AiPanelExportConversation(pane_id, ExportFormat::Markdown));
-        let export_json = Button::new(Text::new("Export JSON").size(11.0))
-            .on_press(Message::AiPanelExportConversation(pane_id, ExportFormat::Json));
-        let export_text = Button::new(Text::new("Export TXT").size(11.0))
-            .on_press(Message::AiPanelExportConversation(pane_id, ExportFormat::Text));
-        header = header
-            .push(export_md)
-            .push(export_json)
-            .push(export_text);
-        let export_session_md = Button::new(Text::new("Session MD").size(10.0))
-            .on_press(Message::AiPanelExportSession(ExportFormat::Markdown));
-        let export_session_json = Button::new(Text::new("Session JSON").size(10.0))
-            .on_press(Message::AiPanelExportSession(ExportFormat::Json));
-        let export_session_text = Button::new(Text::new("Session TXT").size(10.0))
-            .on_press(Message::AiPanelExportSession(ExportFormat::Text));
-        let session_export_row = Row::new()
-            .push(Text::new("Session:").size(10.0).style(Color::from_rgb(0.7, 0.7, 0.7)))
-            .push(export_session_md)
-            .push(export_session_json)
-            .push(export_session_text)
-            .spacing(6)
+    fn render_ai_panel<'a>(&self, ai_context_scope: AiContextScope, ai_chat: &'a [AiChatMessage], ai_input: &'a str, ai_pending: bool, ai_streaming: bool, pane_id: usize, theme_config: &'a ThemeConfig, _ai_preview: AiContextPreview, ai_settings: &'a AiSettings, _ai_redaction_override: bool, ai_last_redactions: &'a [String], _ai_last_redacted_preview: Option<&'a str>, _ai_selected_template: Option<AiPromptTemplateId>, _plan_tier: PlanTier, _plan_limits: PlanLimits, _usage_snapshot: UsageSnapshot) -> Element<'a, Message> {
+        // Clean header with just title and close button
+        let header = Row::new()
+            .push(Text::new("AI Assistant").size(16.0).style(Color::from_rgb(0.9, 0.9, 0.9)))
+            .push(Container::new(Button::new(Text::new("×").size(18.0)).on_press(Message::ToggleAiPanel)).width(Length::Fill))
+            .align_items(Alignment::Center)
+            .spacing(8);
+
+        // Quick action buttons - simplified
+        let quick_actions = Row::new()
+            .push(Button::new(Text::new("🔍 Explain Error").size(11.0)).on_press(Message::AiPanelQuickAction(pane_id, AiQuickAction::ExplainError)))
+            .push(Button::new(Text::new("📝 Summarize").size(11.0)).on_press(Message::AiPanelQuickAction(pane_id, AiQuickAction::SummarizeOutput)))
+            .push(Button::new(Text::new("⚡ Generate").size(11.0)).on_press(Message::AiPanelQuickAction(pane_id, AiQuickAction::GenerateCommand)))
+            .spacing(8);
+
+        // Context selector - minimal
+        let scope_label = match ai_context_scope {
+            AiContextScope::CurrentCommand => "Current",
+            AiContextScope::LastNBlocks => "Last N",
+            AiContextScope::SelectedBlocks => "Selected",
+            AiContextScope::EntireSession => "All",
+        };
+        let scope_row = Row::new()
+            .push(Text::new("Context: ").size(11.0).style(Color::from_rgb(0.65, 0.65, 0.65)))
+            .push(Button::new(Text::new(scope_label).size(11.0)).on_press(Message::AiPanelSetScope(pane_id, match ai_context_scope {
+                AiContextScope::CurrentCommand => AiContextScope::LastNBlocks,
+                AiContextScope::LastNBlocks => AiContextScope::SelectedBlocks,
+                AiContextScope::SelectedBlocks => AiContextScope::EntireSession,
+                AiContextScope::EntireSession => AiContextScope::CurrentCommand,
+            })))
+            .spacing(4)
             .align_items(Alignment::Center);
 
-        let scope_label = match ai_context_scope {
-            AiContextScope::CurrentCommand => "Context: Current command",
-            AiContextScope::LastNBlocks => "Context: Last N blocks",
-            AiContextScope::SelectedBlocks => "Context: Selected blocks",
-            AiContextScope::EntireSession => "Context: Entire session",
-        };
-        let scope_text = Text::new(scope_label).size(11.0).style(Color::from_rgb(0.7, 0.7, 0.7));
-
-        let scope_row = Row::new()
-            .push(Button::new(Text::new("Current").size(11.0)).on_press(Message::AiPanelSetScope(pane_id, AiContextScope::CurrentCommand)))
-            .push(Button::new(Text::new("Last N").size(11.0)).on_press(Message::AiPanelSetScope(pane_id, AiContextScope::LastNBlocks)))
-            .push(Button::new(Text::new("Selected").size(11.0)).on_press(Message::AiPanelSetScope(pane_id, AiContextScope::SelectedBlocks)))
-            .push(Button::new(Text::new("All").size(11.0)).on_press(Message::AiPanelSetScope(pane_id, AiContextScope::EntireSession)))
-            .spacing(6);
-
-        let quick_actions = Row::new()
-            .push(Button::new(Text::new("Explain Error").size(11.0)).on_press(Message::AiPanelQuickAction(pane_id, AiQuickAction::ExplainError)))
-            .push(Button::new(Text::new("Summarize Output").size(11.0)).on_press(Message::AiPanelQuickAction(pane_id, AiQuickAction::SummarizeOutput)))
-            .push(Button::new(Text::new("Generate Command").size(11.0)).on_press(Message::AiPanelQuickAction(pane_id, AiQuickAction::GenerateCommand)))
-            .spacing(6);
-
-        let preview_text = Text::new(format!("Context: {} blocks • {} chars • ~{} tokens", ai_preview.block_count, ai_preview.char_count, ai_preview.token_estimate))
-            .size(11.0)
-            .style(Color::from_rgb(0.65, 0.65, 0.65));
-
-        let plan_label = match plan_tier {
-            PlanTier::Free => "Free",
-            PlanTier::Pro => "Pro",
-            PlanTier::Team => "Team",
-        };
-        let usage_text = Text::new(format!(
-            "Plan: {} • Messages: {}/{} • Chars: {}/{} • Streaming: {}",
-            plan_label,
-            usage_snapshot.used_messages,
-            plan_limits.daily_messages,
-            usage_snapshot.used_chars,
-            plan_limits.daily_chars,
-            if plan_limits.allow_streaming { "On" } else { "Off" }
-        ))
-        .size(11.0)
-        .style(Color::from_rgb(0.7, 0.7, 0.7));
-
-        let mut template_row = Row::new().spacing(6);
-        for template in AI_PROMPT_TEMPLATES {
-            let is_selected = ai_selected_template == Some(template.id);
-            let label = if is_selected {
-                format!("{} ✓", template.label)
-            } else {
-                template.label.to_string()
-            };
-            let button = Button::new(Text::new(label).size(11.0))
-                .on_press(Message::AiTemplateSelected(pane_id, template.id));
-            template_row = template_row.push(button);
+        // Show redaction warning only if secrets detected
+        let mut redaction_warning = Column::new();
+        if ai_settings.redact_secrets && !ai_last_redactions.is_empty() {
+            let warning_text = Text::new(format!("⚠️ Secrets detected: {}", ai_last_redactions.len()))
+                .size(10.0)
+                .style(Color::from_rgb(0.9, 0.7, 0.3));
+            redaction_warning = redaction_warning.push(warning_text);
         }
-        let template_help = Text::new("Templates")
-            .size(11.0)
-            .style(Color::from_rgb(0.7, 0.7, 0.7));
-        let template_picker = Column::new()
-            .spacing(6)
-            .push(template_help)
-            .push(template_row);
 
-        let mut redaction_column = Column::new().spacing(6);
-        if ai_settings.redact_secrets {
-            let redaction_status = if ai_last_redactions.is_empty() {
-                Text::new("Redaction: none detected")
-                    .size(11.0)
-                    .style(Color::from_rgb(0.55, 0.55, 0.55))
-            } else {
-                Text::new(format!("Redaction: {}", ai_last_redactions.join(", ")))
-                    .size(11.0)
-                    .style(Color::from_rgb(0.9, 0.75, 0.35))
-            };
-            let allow_label = if ai_redaction_override { "Sending sensitive" } else { "Redaction enforced" };
-            let allow_button = Button::new(Text::new(allow_label).size(11.0))
-                .on_press(Message::AiPanelToggleRedactionOverride(pane_id, !ai_redaction_override));
-            let reload_button = Button::new(Text::new("Reload rules").size(11.0))
-                .on_press(Message::AiPanelReloadRedactionRules);
-            let mut redaction_row = Row::new().spacing(6).push(allow_button).push(reload_button);
-            if !ai_last_redactions.is_empty() {
-                let preview_button = Button::new(Text::new("Show redacted preview").size(11.0))
-                    .on_press(Message::AiPanelOpenRedactionPreview(pane_id));
-                redaction_row = redaction_row.push(preview_button);
-            }
-            redaction_column = redaction_column.push(redaction_status).push(redaction_row);
-            if let Some(preview) = ai_last_redacted_preview {
-                if !preview.is_empty() {
-                    let preview_text = Text::new(preview.to_string())
-                        .font(Font::MONOSPACE)
-                        .size(theme_config.font_size - 3.0)
-                        .style(Color::from_rgb(0.75, 0.75, 0.75));
-                    let preview_container = Container::new(preview_text)
-                        .padding(6)
-                        .style(|_theme: &Theme| container::Appearance {
-                            background: Some(Background::Color(Color::from_rgb(0.1, 0.1, 0.12))),
-                            border: Border {
-                                radius: 4.0.into(),
-                                width: 1.0,
-                                color: Color::from_rgb(0.22, 0.22, 0.24),
-                            },
-                            ..Default::default()
+        // Chat messages - clean display
+        let mut chat_column = Column::new().spacing(10);
+        
+        // Show welcome message if no chat history
+        if ai_chat.is_empty() {
+            let welcome = Text::new("Hi! I'm your AI assistant. I can help you:\n• Explain errors and fix issues\n• Understand command output\n• Generate shell commands\n• Answer questions about your terminal")
+                .size(12.0)
+                .style(Color::from_rgb(0.65, 0.65, 0.65));
+            chat_column = chat_column.push(Container::new(welcome).padding(12));
+        } else {
+            for message in ai_chat {
+                let (role_label, role_icon, role_color, _alignment) = match message.role {
+                    AiChatRole::User => ("You", "👤", Color::from_rgb(0.6, 0.8, 1.0), Alignment::End),
+                    AiChatRole::Assistant => ("AI", "🤖", Color::from_rgb(0.5, 0.9, 0.6), Alignment::Start),
+                };
+                
+                let header = Row::new()
+                    .push(Text::new(role_icon).size(12.0))
+                    .push(Text::new(role_label).size(11.0).style(role_color))
+                    .spacing(4);
+
+                // Show sources as compact chips
+                let sources: Element<'a, Message> = if !message.sources.is_empty() {
+                    let mut chip_row = Row::new().spacing(4);
+                    for citation in message.sources.iter().take(3) {
+                        let label = citation.label.clone();
+                        let block_index = citation.block_index;
+                        let chip = mouse_area(
+                            Container::new(Text::new(format!("🔗 {}", label)).size(9.0))
+                                .padding([2, 6])
+                                .style(|_theme: &Theme| container::Appearance {
+                                    background: Some(Background::Color(Color::from_rgb(0.2, 0.22, 0.26))),
+                                    border: Border {
+                                        radius: 10.0.into(),
+                                        width: 0.5,
+                                        color: Color::from_rgb(0.35, 0.37, 0.42),
+                                    },
+                                    ..Default::default()
+                                }),
+                        )
+                        .on_press(match block_index {
+                            Some(index) => Message::AiPanelJumpToBlock(pane_id, index),
+                            None => Message::AiPanelHoverCitation(pane_id, None),
                         });
-                    let hide_button = Button::new(Text::new("Hide preview").size(11.0))
-                        .on_press(Message::AiPanelCloseRedactionPreview(pane_id));
-                    redaction_column = redaction_column.push(preview_container).push(hide_button);
-                }
-            }
-        }
-
-        let mut chat_column = Column::new().spacing(8);
-        for message in ai_chat {
-            let role_label = match message.role {
-                AiChatRole::User => "You",
-                AiChatRole::Assistant => "AI",
-            };
-            let role_color = match message.role {
-                AiChatRole::User => Color::from_rgb(0.55, 0.75, 0.95),
-                AiChatRole::Assistant => Color::from_rgb(0.75, 0.85, 0.65),
-            };
-            let header = Row::new()
-                .push(Text::new(role_label).size(11.0).style(role_color))
-                .spacing(4);
-
-            let sources: Element<'a, Message> = if message.sources.is_empty() {
-                Text::new("sources: none").size(10.0).style(Color::from_rgb(0.55, 0.55, 0.55)).into()
-            } else {
-                let mut chip_row = Row::new().spacing(6);
-                for citation in &message.sources {
-                    let label = citation.label.clone();
-                    let block_index = citation.block_index;
-                    let chip = mouse_area(
-                        Container::new(Text::new(label).size(10.0))
-                            .padding([2, 6])
-                            .style(|_theme: &Theme| container::Appearance {
-                                background: Some(Background::Color(Color::from_rgb(0.18, 0.20, 0.24))),
-                                border: Border {
-                                    radius: 10.0.into(),
-                                    width: 1.0,
-                                    color: Color::from_rgb(0.28, 0.30, 0.36),
-                                },
-                                ..Default::default()
-                            }),
-                    )
-                    .on_enter(Message::AiPanelHoverCitation(pane_id, block_index))
-                    .on_exit(Message::AiPanelHoverCitation(pane_id, None))
-                    .on_press(match block_index {
-                        Some(index) => Message::AiPanelJumpToBlock(pane_id, index),
-                        None => Message::AiPanelHoverCitation(pane_id, None),
+                        chip_row = chip_row.push(chip);
+                    }
+                    Row::new().spacing(4).push(chip_row).into()
+                } else {
+                    Row::new().into()
+                };
+                
+                let body = Text::new(message.content.clone())
+                    .size(theme_config.font_size - 2.0)
+                    .style(Color::from_rgb(0.95, 0.95, 0.95));
+                    
+                let bubble = Column::new()
+                    .spacing(6)
+                    .push(header)
+                    .push(body)
+                    .push(sources);
+                    
+                let bubble_color = match message.role {
+                    AiChatRole::User => Color::from_rgb(0.14, 0.16, 0.20),
+                    AiChatRole::Assistant => Color::from_rgb(0.16, 0.18, 0.22),
+                };
+                
+                let bubble_container = Container::new(bubble)
+                    .padding(10)
+                    .style(move |_theme: &Theme| container::Appearance {
+                        background: Some(Background::Color(bubble_color)),
+                        border: Border {
+                            radius: 8.0.into(),
+                            width: 0.5,
+                            color: Color::from_rgb(0.28, 0.28, 0.28),
+                        },
+                        ..Default::default()
                     });
-                    chip_row = chip_row.push(chip);
-                }
-                let sources_label = Text::new("sources:").size(10.0).style(Color::from_rgb(0.55, 0.55, 0.55));
-                Row::new().spacing(6).push(sources_label).push(chip_row).into()
-            };
-            let body = Text::new(message.content.clone())
-                .font(Font::MONOSPACE)
-                .size(theme_config.font_size - 2.0);
-            let bubble = Column::new().spacing(4).push(header).push(sources).push(body);
-            let bubble_container = Container::new(bubble)
-                .padding(8)
-                .style(|_theme: &Theme| container::Appearance {
-                    background: Some(Background::Color(Color::from_rgb(0.16, 0.16, 0.18))),
-                    border: Border {
-                        radius: 6.0.into(),
-                        width: 1.0,
-                        color: Color::from_rgb(0.24, 0.24, 0.24),
-                    },
-                    ..Default::default()
-                });
-            chat_column = chat_column.push(bubble_container);
+                    
+                chat_column = chat_column.push(bubble_container);
+            }
         }
 
         let chat_scroll = Scrollable::new(chat_column)
-            .height(Length::Fill)
+            .height(Length::FillPortion(8))
             .width(Length::Fill);
 
-        let input = TextInput::new("Ask anything...", ai_input)
+        // Input area - clean and prominent
+        let input = TextInput::new("Ask me anything...", ai_input)
             .on_input(move |value| Message::AiPanelInputChanged(pane_id, value))
             .on_submit(Message::AiPanelSend(pane_id))
-            .padding(8)
-            .size(theme_config.font_size - 1.0)
-            .font(Font::MONOSPACE);
+            .padding(12)
+            .size(theme_config.font_size);
 
-        let send_button = Button::new(Text::new("Send").size(12.0))
-            .on_press(Message::AiPanelSend(pane_id));
-        let stop_button = Button::new(Text::new("Stop").size(12.0))
-            .on_press(Message::AiPanelStop(pane_id));
-
-        let status_text = if ai_pending || ai_streaming {
-            Text::new("Generating...").size(11.0).style(Color::from_rgb(0.75, 0.75, 0.75))
+        let button = if ai_pending || ai_streaming {
+            Button::new(Text::new("⏸️ Stop").size(12.0))
+                .on_press(Message::AiPanelStop(pane_id))
         } else {
-            Text::new("Idle").size(11.0).style(Color::from_rgb(0.55, 0.55, 0.55))
+            Button::new(Text::new("➤ Send").size(12.0))
+                .on_press(Message::AiPanelSend(pane_id))
+        };
+
+        let status_text = if ai_pending {
+            Text::new("⌛ Thinking...").size(10.0).style(Color::from_rgb(0.8, 0.7, 0.4))
+        } else if ai_streaming {
+            Text::new("✍️ Typing...").size(10.0).style(Color::from_rgb(0.6, 0.8, 0.6))
+        } else {
+            Text::new("✓ Ready").size(10.0).style(Color::from_rgb(0.5, 0.5, 0.5))
         };
 
         let input_row = Row::new()
             .push(Container::new(input).width(Length::Fill))
-            .push(send_button)
-            .push(stop_button)
-            .spacing(6)
+            .push(button)
+            .spacing(8)
             .align_items(Alignment::Center);
 
-        let tip_text = ai_selected_template
-            .and_then(|id| AI_PROMPT_TEMPLATES.iter().find(|template| template.id == id))
-            .map(|template| template.tip)
-            .unwrap_or("Tip: choose a template to get a tailored prompt starter.");
-        let tip = Text::new(tip_text)
-            .size(11.0)
-            .style(Color::from_rgb(0.65, 0.65, 0.65));
-
         let body = Column::new()
-            .spacing(10)
+            .spacing(12)
             .push(header)
-            .push(session_export_row)
-            .push(usage_text)
-            .push(scope_text)
-            .push(scope_row)
             .push(quick_actions)
-            .push(preview_text)
-            .push(template_picker)
-            .push(redaction_column)
+            .push(scope_row)
+            .push(redaction_warning)
             .push(chat_scroll)
             .push(input_row)
-            .push(tip)
             .push(status_text)
-            .padding(10);
+            .padding(12);
 
         Container::new(body)
             .width(Length::Fill)
