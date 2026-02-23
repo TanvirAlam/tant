@@ -48,6 +48,8 @@ pub struct Block {
     pub selected: bool,
     // Keep output for now, until shared store is implemented
     pub output: String,
+    #[serde(skip, default)]
+    pub output_start_snapshot: String,
     pub git_branch: Option<String>,
     pub git_status: Option<GitStatus>,
     pub host: String,
@@ -172,6 +174,20 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self { ai_onboarding_seen: false, ai_share_link_enabled: true, plan_tier: PlanTier::Free }
     }
+}
+
+fn diff_screen_output(start: &str, end: &str) -> String {
+    if start.is_empty() {
+        return end.trim_end().to_string();
+    }
+    let start_lines: Vec<&str> = start.lines().collect();
+    let end_lines: Vec<&str> = end.lines().collect();
+    let mut idx = 0usize;
+    let max = start_lines.len().min(end_lines.len());
+    while idx < max && start_lines[idx] == end_lines[idx] {
+        idx += 1;
+    }
+    end_lines[idx..].join("\n").trim_end().to_string()
 }
 
 fn default_ai_share_link_enabled() -> bool {
@@ -1808,11 +1824,13 @@ impl Application for Tant {
                                             block.duration_ms = Some((Utc::now() - start).num_milliseconds() as u64);
                                         }
                                         // Capture output at command end
-                                        block.output = pane.parser.screen_text();
+                                        let end_snapshot = pane.parser.screen_text();
+                                        block.output = diff_screen_output(&block.output_start_snapshot, &end_snapshot);
                                         pane.history.push(block);
                                     }
                                     // Clear screen text to start fresh for new command
                                     // Note: We can't actually clear the vt100 screen, but we'll capture the delta
+                                    let screen_snapshot = pane.parser.screen_text();
                                     pane.current_block = Some(Block {
                                         command: String::new(),
                                         started_at: Some(Utc::now()),
@@ -1825,6 +1843,7 @@ impl Application for Tant {
                                         tags: vec![],
                                         selected: false,
                                         output: String::new(),
+                                        output_start_snapshot: screen_snapshot,
                                         git_branch: None,
                                         git_status: None,
                                         host: self.host_info.display.clone(),
@@ -1858,12 +1877,17 @@ impl Application for Tant {
                                             block.duration_ms = Some((Utc::now() - start).num_milliseconds() as u64);
                                         }
                                         // Capture output - this gets the visible screen at command end
-                                        block.output = pane.parser.screen_text();
+                                        let end_snapshot = pane.parser.screen_text();
+                                        block.output = diff_screen_output(&block.output_start_snapshot, &end_snapshot);
                                         pane.history.push(block);
                                         debug!("[Block Detection] Command ended with status {} - block saved", status);
                                     }
                                 }
                             }
+                        }
+                        if let Some(ref mut block) = pane.current_block {
+                            let live_snapshot = pane.parser.screen_text();
+                            block.output = diff_screen_output(&block.output_start_snapshot, &live_snapshot);
                         }
                     }
                 }

@@ -8,7 +8,7 @@ use iced::widget::canvas::{self, Program, Frame};
 use iced::mouse::Cursor;
 use vt100;
 use chrono::Utc;
-use crate::{ExportToast, Message, AiSettings, Block, ThemeConfig, Tab, AiChatMessage, AiChatRole, AiContextScope, AiQuickAction, AiContextPreview, AiPromptTemplateId, PlanTier, PlanLimits, UsageSnapshot, AiCitation, LayoutNode, Axis};
+use crate::{ExportToast, Message, AiSettings, Block, ThemeConfig, Tab, AiChatMessage, AiChatRole, AiContextScope, AiQuickAction, AiContextPreview, AiPromptTemplateId, PlanTier, PlanLimits, UsageSnapshot};
 use crate::export::ExportFormat;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher, DefaultHasher};
